@@ -1,0 +1,12 @@
+[build]
+# Заставляем cargo всегда собирать под ARM по умолчанию
+target = "thumbv7em-none-eabihf"
+
+[target.thumbv7em-none-eabihf]
+# Указываем скрипт линковки для embedded
+rustflags = [
+  "-C", "link-arg=-Tlink.x",
+]
+
+# Опционально: если ты используешь probe-rs для прошивки (рекомендуется вместо старого probe-run)
+# runner = "probe-rs run --chip STM32F303VCTx"
