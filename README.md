@@ -16,7 +16,7 @@ USB-осциллограф на STM32F3Discovery (STM32F303VCT6) + Python GTK3 �
 ```
 .
 ├── Cargo.toml              # Зависимости (embassy-stm32, embassy-usb, defmt, cortex-m)
-├── .cargo/config.toml      # target thumbv7em-none-eabihf, runner probe-rs
+├── .cargo/config.toml      # target thumbv7em-none-eabi, runner probe-rs
 ├── memory.x                # FLASH 0x08000000 256K, RAM 0x20000000 40K
 ├── build.rs                # Копирует memory.x в OUT_DIR для линковщика
 ├── flash.sh                # Один скрипт: udev rules + build + flash
@@ -69,7 +69,7 @@ USB-осциллограф на STM32F3Discovery (STM32F303VCT6) + Python GTK3 �
 
 ```bash
 # Rust target + инструменты
-rustup target add thumbv7em-none-eabihf
+rustup target add thumbv7em-none-eabi
 cargo install flip-link
 cargo install probe-rs --features cli
 cargo install probe-rs-tools

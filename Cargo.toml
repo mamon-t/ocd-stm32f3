@@ -4,57 +4,66 @@ name = "ocd-stm32f3"
 version = "0.1.0"
 license = "MIT OR Apache-2.0"
 
+# Все embassy-* закреплены на ОДИН тег embassy-stm32-v0.6.0 (commit 84444a19).
+# Это актуальная стабильная линейка: embassy-stm32 0.6.0, executor 0.10.0,
+# time 0.5.1, usb 0.6.0. Поднимать версии можно только синхронно по всему
+# кластеру — их API движется вместе.
+# ВАЖНО: crates.io пока не отдаёт embassy-stm32 0.6.0 (индекс в этом окружении
+# недоступен), поэтому зависимое состояние берётся из git по тегу. Если у вас
+# свежий индекс — можно заменить git+rev на version = "0.6.0" без git.
 [dependencies]
-embassy-stm32 = { version = "0.1.0", git = "https://github.com/embassy-rs/embassy", features = [
-    "nightly",
+embassy-stm32 = { version = "0.6.0", git = "https://github.com/embassy-rs/embassy", rev = "84444a19eb57d978e3c09fcdc8e60cdd7278eb03", features = [
     "defmt",
     "stm32f303vc",
     "unstable-pac",
-    "unstable-traits",
     "memory-x",
     "time-driver-any",
     "exti",
+    "time",
 ] }
-embassy-sync = { version = "0.4.0", git = "https://github.com/embassy-rs/embassy", features = [
-    "defmt",
-] }
-embassy-executor = { version = "0.3.1", git = "https://github.com/embassy-rs/embassy", features = [
-    "nightly",
-    "arch-cortex-m",
+embassy-executor = { version = "0.10.0", git = "https://github.com/embassy-rs/embassy", rev = "84444a19eb57d978e3c09fcdc8e60cdd7278eb03", features = [
+    "platform-cortex-m",
     "executor-thread",
     "executor-interrupt",
     "defmt",
-    "integrated-timers",
 ] }
-embassy-time = { version = "0.1.5", git = "https://github.com/embassy-rs/embassy", features = [
+embassy-time = { version = "0.5.1", git = "https://github.com/embassy-rs/embassy", rev = "84444a19eb57d978e3c09fcdc8e60cdd7278eb03", features = [
     "defmt",
     "defmt-timestamp-uptime",
     "tick-hz-32_768",
 ] }
-embassy-usb = { version = "0.1.0", git = "https://github.com/embassy-rs/embassy", features = [
+embassy-usb = { version = "0.6.0", git = "https://github.com/embassy-rs/embassy", rev = "84444a19eb57d978e3c09fcdc8e60cdd7278eb03", features = [
     "defmt",
 ] }
-embassy-futures = { version = "0.1.0", git = "https://github.com/embassy-rs/embassy" }
-# embassy-embedded-hal = { version = "0.1.0", git = "https://github.com/embassy-rs/embassy", features = [
-#     "nightly",
-#     "embedded-hal-async",
-# ] }
-# embedded-hal-async = { version = "1.0.0", optional = true }
+embassy-futures = { version = "0.1.2", git = "https://github.com/embassy-rs/embassy", rev = "84444a19eb57d978e3c09fcdc8e60cdd7278eb03" }
 
-defmt = "0.3"
-defmt-rtt = "0.4.0"
+defmt = "1.0.1"
+defmt-rtt = "1.0.0"
+panic-probe = { version = "1.0.0", features = ["print-defmt"] }
 
 cortex-m = { version = "0.7.6", features = [
     "inline-asm",
     "critical-section-single-core",
 ] }
 cortex-m-rt = "0.7.0"
-embedded-hal = "=1.0.0-rc.1"
-panic-probe = { version = "0.3", features = ["print-defmt"] }
-futures = { version = "0.3.17", default-features = false, features = [
-    "async-await",
-] }
-heapless = { version = "0.7.5", default-features = false }
-nb = "1.0.0"
-embedded-storage = "0.3.0"
-static_cell = { version = "1.1", features = ["nightly"] }
+embedded-hal = "1.0.0"
+# critical-section: реализацию даёт cortex-m (feature "critical-section-single-core"),
+# сам crate нужен в зависимостях напрямую, чтобы `use critical_section::...` резолвился.
+critical-section = "1.1"
+heapless = { version = "0.9", default-features = false }
+
+# probe-rs читает DWARF из .elf, чтобы показывать дефmt-логи и стектрейсы.
+# По умолчанию release stripped=none уже оставляет отладочную информацию,
+# но фиксируем явно: без неё probe-rs печатает
+# "Insufficient DWARF info; compile your program with `debug = 2`".
+[profile.release]
+debug = 2
+strip = false
+
+[[bin]]
+name = "ocd-stm32f3"
+path = "src/main.rs"
+
+[[bin]]
+name = "test_usb"
+path = "src/test_usb.rs"

@@ -6,7 +6,10 @@ use embassy_executor::Spawner;
 use embassy_stm32::time::mhz;
 use embassy_stm32::usb::Driver;
 use embassy_stm32::{bind_interrupts, peripherals, usb, Config};
-use embassy_usb::class::cdc_acm::{CdcAcmClass, State};
+// NOTE: импорта cdc_acm переименованы, чтобы не конфликтовать с трейтами
+// embassy_stm32::dma::{Receiver, State} (нужны для ReadableRingBuffer).
+// test_usb использует только CdcAcmClass и State.
+use embassy_usb::class::cdc_acm::{CdcAcmClass, State as CdcState};
 use embassy_usb::Builder;
 use {defmt_rtt as _, panic_probe as _};
 
@@ -45,7 +48,7 @@ async fn main(_spawner: Spawner) {
     let mut config_descriptor = [0; 256];
     let mut bos_descriptor = [0; 256];
     let mut control_buf = [0; 7];
-    let mut state = State::new();
+    let mut state = CdcState::new();
 
     let mut builder = Builder::new(
         driver,
