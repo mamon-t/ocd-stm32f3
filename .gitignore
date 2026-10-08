@@ -3,3 +3,6 @@
 **/*.rs.bk
 Cargo-.lock.bak
 .gpui-cache/
+
+# временные артефакты переноса истории
+/*.bundle
