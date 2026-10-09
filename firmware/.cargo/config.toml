@@ -1,7 +1,7 @@
 [build]
-# Целевая плата: STM32F303VCT6 — Cortex-M4 БЕЗ FPU.
-# Правильный target: thumbv7em-none-eabi (не eabihf! — иначе rustc ищет
-# non-existent rust-std для eabihf на этом чипе, отсюда "can't find crate for core").
+# Целевая плата: STM32F303VCT6 — Cortex-M4F (FPU есть).
+# Target: thumbv7em-none-eabi (soft-float). Это осознанный выбор: FPU в прошивке
+# не используется, а soft-float убирает зависимость от RET-инструкций/регистров FPU.
 target = "thumbv7em-none-eabi"
 
 [target.thumbv7em-none-eabi]

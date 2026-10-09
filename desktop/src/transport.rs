@@ -3,9 +3,9 @@
 //! Кадр данных MCU→PC (всегда 5 + 2·nch байт):
 //!   `AA 55 <flags(bit7=ovr)> <seq:u8> <nch:1..10> <nch * u16 LE>`
 //! ACK'и — отдельные пакеты:
-//!   `A1 <rate>` | `B1 <ch> <en> <st>` | `B3 <mask_lo> <mask_hi>` | `D1`
+//!   `A1 <rate>` | `B1 <ch> <en> <st>` | `B3 <mask_lo> <mask_hi>` | `A4 <fs:u32 LE>`
 //! Команды PC→MCU:
-//!   `A0 <rate>` | `B0 <ch> <en> <st>` | `B2` | `D0`
+//!   `A0 <rate>` | `B0 <ch> <en> <st>` | `B2`
 //!
 //! Reader живёт в отдельном потоке и складывает кадры/ACK в `crossbeam-channel`;
 //! UI-поток вычитывает их по таймеру.
@@ -22,11 +22,11 @@ pub const DATA_SYNC: [u8; 2] = [0xAA, 0x55];
 pub const CMD_SET_RATE: u8 = 0xA0;
 pub const CMD_SET_CHANNEL: u8 = 0xB0;
 pub const CMD_GET_MASK: u8 = 0xB2;
-pub const CMD_ENTER_DFU: u8 = 0xD0;
+pub const CMD_SET_GEN: u8 = 0xC0;
 pub const ACK_RATE: u8 = 0xA1;
 pub const ACK_CHANNEL: u8 = 0xB1;
 pub const ACK_MASK: u8 = 0xB3;
-pub const ACK_DFU: u8 = 0xD1;
+pub const ACK_FS: u8 = 0xA4;
 
 pub const NUM_CHANNELS: usize = 10;
 pub const MAX_FRAME_LEN: usize = 5 + NUM_CHANNELS * 2; // 25
@@ -48,7 +48,8 @@ pub enum Ack {
     Rate(u8),
     Channel { ch: u8, enabled: bool, sample_time: u8 },
     Mask { lo: u8, hi: u8 },
-    Dfu,
+    /// Измеренная прошивкой частота сканирования (Гц) — это и есть f_s сигнала канала.
+    SampleRate(u32),
 }
 
 #[derive(Debug)]
@@ -102,12 +103,14 @@ impl Transport {
         self.send([CMD_SET_CHANNEL, ch, enabled as u8, sample_time]);
     }
 
-    pub fn get_mask(&self) {
-        self.send([CMD_GET_MASK]);
+pub fn get_mask(&self) {
+        self.send(&[CMD_GET_MASK]);
     }
 
-    pub fn enter_dfu(&self) {
-        self.send([CMD_ENTER_DFU]);
+    /// Включить/настроить тестовый генератор. `cfg`: бит0=вкл, биты[2:1]=форма
+    /// (0=const, 1=синус, 2=треугольник, 3=меандр), биты[5:3]=амплитуда 0..7.
+    pub fn set_gen(&self, cfg: u8) {
+        self.send(&[CMD_SET_GEN, cfg]);
     }
 
     #[allow(clippy::len_without_is_empty)]
@@ -249,9 +252,10 @@ fn drain(buf: &mut Vec<u8>, ev_tx: &Sender<Event>) {
         }
         // --- ACK-пакеты ---
         let need = match b0 {
-            ACK_RATE | ACK_DFU => 2,
+            ACK_RATE => 2,
             ACK_MASK => 3,
             ACK_CHANNEL => 4,
+            ACK_FS => 5,
             _ => {
                 buf.remove(0); // мусор
                 continue;
@@ -262,13 +266,13 @@ fn drain(buf: &mut Vec<u8>, ev_tx: &Sender<Event>) {
         }
         let ack = match b0 {
             ACK_RATE => Ack::Rate(buf[1]),
-            ACK_DFU => Ack::Dfu,
             ACK_MASK => Ack::Mask { lo: buf[1], hi: buf[2] },
             ACK_CHANNEL => Ack::Channel {
                 ch: buf[1],
                 enabled: buf[2] != 0,
                 sample_time: buf[3],
             },
+            ACK_FS => Ack::SampleRate(u32::from_le_bytes([buf[1], buf[2], buf[3], buf[4]])),
             _ => unreachable!(),
         };
         buf.drain(..need);
@@ -305,6 +309,16 @@ mod tests {
         let Event::Frame { overrun, channels, .. } = rx.try_recv().unwrap() else { panic!("no frame") };
         assert!(overrun);
         assert_eq!(channels, vec![(0, 0x1042)]);
+        assert!(buf.is_empty());
+    }
+
+    #[test]
+    fn parses_fs_ack() {
+        let mut buf = vec![0xA4, 0x40, 0x1F, 0x00, 0x00];
+        let (tx, rx) = bounded(4);
+        drain(&mut buf, &tx);
+        let Event::Ack(Ack::SampleRate(fs)) = rx.try_recv().unwrap() else { panic!("no fs ack") };
+        assert_eq!(fs, 8000);
         assert!(buf.is_empty());
     }
 

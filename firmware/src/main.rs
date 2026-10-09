@@ -9,18 +9,27 @@
 // Архитектура передачи данных:
 //   - CDC-ACM разделён через split(): Sender живёт в задаче потока кадров,
 //     Receiver — в задаче команд. Приём команд больше не тормозит поток.
-//   - ACK ответов нет: команды применяются атомарно, подтверждением служит
-//     следующая команда GET_MASK / изменение потока кадров. Один Writer
-//     исключает гонку за IN-эндпоинт между задачами.
+//   - Все ACK (A1/B1/B3 + периодический A4) уходят строго через Sender
+//     задачи потока кадров (ACK-очередь): один Writer исключает гонку
+//     за IN-эндпоинт между задачами.
 //   - Общая конфигурация каналов за critical-section mutex; задача потока
 //     читает копию перед каждой сборкой кадра.
-//   - DFU-команда ставит magic в BKP0R и делает sys_reset; приложение при
-//     старте ОБЯЗАТЕЛЬНО сбрасывает BKP0R (иначе любой рестарт кидал бы в
-//     бутлоадер снова — баг прежней прошивки).
+//   - Вход в DFU — только аппаратно: BOOT0=1 (SB19) + RESET. Команды 0xD0
+//     в прошивке нет (механизм с magic в BKP0R/SYSCFG не соответствует
+//     RM0316: режим загрузки определяется пином BOOT0 и не переключается
+//     софтовым битом SYSCFG_MEMRMP).
+//   - Тестовый генератор: программная развёртка сигнала через DAC1_OUT1 (PA4),
+//     20 кГц / фиксированная 1 кГц. Управление — команда 0xC0 (см. ниже).
+//   - LED-индикация (LD… на PE8..PE15, активный высокий уровень):
+//     LD4 (PE8, синий) — «прошивка жива» (мигание heartbeat);
+//     LD5 (PE10, оранж.) — USB-CDC подключён;
+//     LD6 (PE15, зелёный) — идут кадры данных;
+//     LD7 (PE11, зелёный) — тестовый генератор включён;
+//     LD10 (PE13, красный) — тревога (overrun/потеря ACK), мигает ~4 с.
 // ---------------------------------------------------------------------------
 
 use core::cell::RefCell;
-use core::sync::atomic::{AtomicBool, Ordering};
+use core::sync::atomic::{AtomicU8, Ordering};
 // Критические секции через cortex-m (в Cargo.toml включён feature
 // "critical-section-single-core" — он реализует глобальный критический мьютекс).
 use critical_section::{with, Mutex};
@@ -32,7 +41,7 @@ use embassy_stm32::gpio::{Level, Output, Speed};
 use embassy_stm32::time::mhz;
 use embassy_stm32::usb::Driver;
 use embassy_stm32::{bind_interrupts, peripherals, usb, Config};
-use embassy_time::Timer;
+use embassy_time::{Instant, Timer};
 use embassy_usb::class::cdc_acm::{CdcAcmClass, Receiver, Sender, State};
 use embassy_usb::Builder;
 // Транспорт defmt: предоставляет символы _defmt_write/_defmt_acquire и пр.
@@ -54,32 +63,42 @@ bind_interrupts!(struct Irqs {
 //   [0]=0xAA [1]=0x55 [2]=flags(bit7=ADC overrun) [3]=seq:u8 [4]=nch(1..10)
 //   [5..] = отсчёты u16 LE только включённых каналов по возрастанию номера.
 // Команды PC->MCU:  0xA0 <rate> | 0xB0 <ch> <en> <st> | 0xB2 (запрос маски)
-//                   0xD0 (рейд в DFU)
-// Ответ на 0xB2:    0xB3 <mask_lo> <mask_hi>
+//                   | 0xC0 <cfg> — тестовый генератор DAC1: бит0=вкл,
+//                     биты[2:1]=форма (0=const, 1=синус, 2=треугольник,
+//                     3=меандр), биты[5:3]=амплитуда 0..7 (peak=128*(n+1) кода)
+// ACK MCU->PC:      0xA1 <level> | 0xB1 <ch> <en> <st> | 0xB3 <mask_lo> <mask_hi>
+//                   периодически 0xA4 <fs:u32 LE> — измеренный темп сканов (Гц)
 const DMA_BUF_SIZE: usize = 512;
 const NUM_CHANNELS: usize = 10;
-// ADC1 Common Interface (STM32F3): DR на смещении 0x48, НЕ 0x40 (там SR).
+// ADC1 (RM0316 §15.5): регистр данных DATA[15:0] на смещении 0x40
+// (0x00 ISR, 0x04 IER, 0x08 CR, 0x0C CFGR, 0x14 SMPR1, 0x18 SMPR2,
+//  0x20/0x24/0x28 TR1/TR2/TR3, 0x30 SQR1, 0x34 SQR2, 0x38 SQR3, 0x3C SQR4,
+//  0x40 DR, 0x4C JSQR).
 const ADC1_BASE: usize = 0x5000_0000;
-const ADC1_DR_ADDR: usize = ADC1_BASE + 0x48;
-const ADC1_SQR1_ADDR: usize = ADC1_BASE + 0x28; // регистр длины последовательности L[4:0]
+const ADC1_DR_ADDR: usize = ADC1_BASE + 0x40;
 const FRAME_LEN: usize = 5 + NUM_CHANNELS * 2;
 
-const ADC_HW_CHANNELS: [u8; NUM_CHANNELS] = [0, 1, 2, 3, 4, 5, 6, 7, 8, 9];
+// Номера каналов ADC1 для выводов PA0, PA1, PA2, PA3, PF4, PC0, PC1, PC2, PC3, PF2
+// (порядок GPIO -> номер канала согласно SVD STM32F303VC: PA0=1 ... PF2=10).
+const ADC_HW_CHANNELS: [u8; NUM_CHANNELS] = [1, 2, 3, 4, 5, 6, 7, 8, 9, 10];
 
 const DATA_SYNC: [u8; 2] = [0xAA, 0x55];
 const CMD_SET_RATE: u8 = 0xA0;
 const CMD_SET_CHANNEL: u8 = 0xB0;
 const CMD_GET_MASK: u8 = 0xB2;
-const CMD_ENTER_DFU: u8 = 0xD0;
-const STATUS_FRAME: u8 = 0x40; // бит в flags: это статус-кадр (ответ на 0xB2), не данные
+const CMD_SET_GEN: u8 = 0xC0; // конфигурация тестового генератора (см. шапку)
+const ACK_RATE: u8 = 0xA1; // ответ на 0xA0: применённый уровень времени выборки
+const ACK_CHANNEL: u8 = 0xB1; // ответ на 0xB0: <ch> <en> <st>
+const ACK_MASK: u8 = 0xB3; // ответ на 0xB2: маска включённых каналов (mask_lo, mask_hi)
+const ACK_FS: u8 = 0xA4; // измеренная частота сканирования, u32 LE (Гц)
 
-const DFU_MAGIC: u32 = 0xDEADBEEF;
-// Адрес System Memory (ROM-загрузчик) F303: 0x1FFFD800. Прямой прыжок туда не
-// используется — вместо него штатный рейд через SYSCFG BOOT_EN + sys_reset
-// (см. enter_dfu_mode). Оставлено как справка.
-#[allow(dead_code)]
-const SYSTEM_BOOTLOADER_ADDR: u32 = 0x1FFFD800;
-const BKP0R_ADDR: usize = 0x4000_2850;
+// Конфигурация тестового генератора (raw-байт команды 0xC0).
+static GEN_CFG: AtomicU8 = AtomicU8::new(0);
+// Флаги состояния для LED-индикации (см. led_task): USB подключён / данные / тревога.
+const ST_USB: u8 = 1 << 0;
+const ST_DATA: u8 = 1 << 1;
+const ST_ALARM: u8 = 1 << 2;
+static STATUS: AtomicU8 = AtomicU8::new(0);
 
 #[derive(Clone, Copy)]
 struct ChannelCfg {
@@ -87,8 +106,57 @@ struct ChannelCfg {
     sample_time: u8,
 }
 
-/// Флаг «хост запросил маску» (ставит cmd_task, сбрасывает data_task).
-static ACK_PENDING: AtomicBool = AtomicBool::new(false);
+/// Очередь ACK-пакетов: команды кладут ответы здесь, а единственный писатель
+/// IN-эндпоинта (data_task) вычитывает и отправляет их перед очередным кадром.
+const ACK_QUEUE_LEN: usize = 16;
+const ACK_MAX_LEN: usize = 5;
+
+#[derive(Clone, Copy)]
+struct AckPkt {
+    data: [u8; ACK_MAX_LEN],
+    len: u8,
+}
+
+struct AckQueue {
+    slots: [AckPkt; ACK_QUEUE_LEN],
+    head: usize,
+    count: usize,
+}
+
+impl AckQueue {
+    const fn new() -> Self {
+        Self {
+            slots: [AckPkt { data: [0; ACK_MAX_LEN], len: 0 }; ACK_QUEUE_LEN],
+            head: 0,
+            count: 0,
+        }
+    }
+    fn push(&mut self, pkt: &[u8]) {
+        if self.count >= ACK_QUEUE_LEN {
+            return;
+        }
+        let idx = (self.head + self.count) % ACK_QUEUE_LEN;
+        let n = pkt.len().min(ACK_MAX_LEN);
+        self.slots[idx].data[..n].copy_from_slice(&pkt[..n]);
+        self.slots[idx].len = n as u8;
+        self.count += 1;
+    }
+    fn pop(&mut self) -> Option<AckPkt> {
+        if self.count == 0 {
+            return None;
+        }
+        let idx = self.head;
+        self.head = (self.head + 1) % ACK_QUEUE_LEN;
+        self.count -= 1;
+        Some(self.slots[idx])
+    }
+}
+
+static ACK_QUEUE: Mutex<RefCell<AckQueue>> = Mutex::new(RefCell::new(AckQueue::new()));
+
+fn push_ack(pkt: &[u8]) {
+    with(|cs| ACK_QUEUE.borrow_ref_mut(cs).push(pkt));
+}
 
 static CH_CFG: Mutex<RefCell<[ChannelCfg; NUM_CHANNELS]>> = Mutex::new(RefCell::new([ChannelCfg {
     enabled: true,
@@ -115,52 +183,6 @@ fn set_channel_cfg(ch: usize, enable: bool, st: u8) {
             cfgs[ch].sample_time = st;
         }
     });
-}
-
-/// Вызов из `main` ДО инициализации периферии: если бутлоадер запрошен —
-/// прыгаем в системный memory bootloader; иначе чистим magic, чтобы следующий
-/// обычный рестарт не угодил в бутлоадер повторно.
-fn check_and_enter_bootloader() {
-    unsafe {
-        let bkp0r = BKP0R_ADDR as *mut u32;
-        let magic = core::ptr::read_volatile(bkp0r);
-        if magic == DFU_MAGIC {
-            // Сбрасываем magic и уходим в системный memory bootloader по
-            // официальной процедуре AN4536 (STM32F3): BL=1, nBOOT_SEL/nBOOT1/
-            // nBOOT0=0, скидываем все активные конфиги SYSCFG, гасим USB PHY
-            // (D+ pull-up остаётся поднятым -> хост видит "DFU-mode device"),
-            // глобальный reset. Boot ROM на сбросе читает эти биты и стартует
-            // из SystemMemory.
-            core::ptr::write_volatile(bkp0r, 0);
-            cortex_m::interrupt::disable();
-
-            let syscfg = 0x4001_0000usize as *mut u32; // SYSCFG->MEMRMP
-            (*syscfg) &= !(1 << 8 | 1 << 9 | 1 << 10 | 1 << 11); // BL | nBOOT_SEL | nBOOT1 | nBOOT0
-            *(0x4001_0004usize as *mut u32) = 0; // SYSCFG->UR_SET: clear CFGRST
-
-            let usb = 0x5000_0000usize as *mut u32; // USB base
-            let cnf = *(usb as *const u32); // CNF = offset 0x00
-            *(usb as *mut u32) = cnf & !(1 << 23); // clear FORCE_FMODS -> internal PU off
-            *(usb.add(0x40 / 4)) |= 1 << 15; // PDWN in KCSR
-
-            cortex_m::peripheral::SCB::sys_reset();
-        }
-        // Магическое значение протухло сразу после обычной проверки.
-        core::ptr::write_volatile(bkp0r, 0);
-    }
-}
-
-fn enter_dfu_mode() -> ! {
-    unsafe {
-        // 1) Magic в BKP0R — на случай, если загрузчик/внешний скрипт проверяет его.
-        core::ptr::write_volatile(BKP0R_ADDR as *mut u32, DFU_MAGIC);
-        // 2) Штатный способ STM32F3: SYSCFG->MEMRMP bit BOOT_EN (0x40010000 + 0x00),
-        //    затем soft-reset. ROM-загрузчик сам сбросит этот бит при выходе в app.
-        const SYSCFG_MEMRMP: usize = 0x4001_0000;
-        core::ptr::write_volatile(SYSCFG_MEMRMP as *mut u32,
-            core::ptr::read_volatile(SYSCFG_MEMRMP as *const u32) | 1); // BOOT_EN
-        cortex_m::peripheral::SCB::sys_reset();
-    }
 }
 
 fn adc_write_sequence(sample_time: u8) -> usize {
@@ -206,52 +228,32 @@ fn adc_write_sequence(sample_time: u8) -> usize {
         seq_list[0] = ADC_HW_CHANNELS[0];
         n = 1;
     }
-    unsafe {
-        // SQR1[4:0] = L (длина-1); SQ bits стартуют с бита 6.
-        let mut sqr1: u32 = ((n as u32) - 1) & 0x1F;
+    // SQR1: L[3:0]=длина-1, SQ1..SQ4 с шагом 6 бит от бита 6 (RM0316 §15.5.10);
+    // SQR2: SQ5..SQ9; SQR3: SQ10+ — значения каналов пишутся как есть.
+    pac::ADC1.sqr1().modify(|w| {
+        w.set_l((n as u8).wrapping_sub(1));
         for i in 0..n.min(4) {
-            sqr1 |= (seq_list[i] as u32) << (6 + i * 5);
+            w.set_sq(i, seq_list[i]);
         }
-        core::ptr::write_volatile(ADC1_SQR1_ADDR as *mut u32, sqr1);
-    }
+    });
     if n > 4 {
-        unsafe {
-            let mut sqr2: u32 = 0;
-            for i in 0..(n - 4).min(4) {
-                sqr2 |= (seq_list[4 + i] as u32) << (i * 5);
+        pac::ADC1.sqr2().modify(|w| {
+            for i in 0..(n - 4).min(5) {
+                w.set_sq(i, seq_list[4 + i]);
             }
-            core::ptr::write_volatile((ADC1_BASE + 0x2C) as *mut u32, sqr2);
-        }
+        });
     }
-    if n > 8 {
-        unsafe {
-            let mut sqr3: u32 = 0;
-            for i in 0..(n - 8) {
-                sqr3 |= (seq_list[8 + i] as u32) << (i * 5);
-            }
-            core::ptr::write_volatile((ADC1_BASE + 0x30) as *mut u32, sqr3);
-        }
+    if n > 9 {
+        pac::ADC1.sqr3().modify(|w| {
+            w.set_sq(0, seq_list[9]);
+        });
     }
-    pac::ADC1.sqr2().modify(|w| {
-        for i in 0..4 {
-            w.set_sq(i, ADC_HW_CHANNELS[4 + i]);
-        }
-    });
-    pac::ADC1.sqr3().modify(|w| {
-        for i in 0..2 {
-            w.set_sq(i, ADC_HW_CHANNELS[8 + i]);
-        }
-    });
-
-    // SMPR1: каналы 1-9, SMPR2: канал 0
-    pac::ADC1.smpr1().modify(|w| {
-        for ch in 1..=9 {
-            w.set_smp(ch, st);
-        }
-    });
-    pac::ADC1.smpr2().modify(|w| {
-        w.set_smp(0, st);
-    });
+    // SMPR1: каналы 1..9 -> поле SMP1..SMP9 (индекс = номер канала - 1);
+    // SMPR2: индекс 0 -> канал 10 (RM0316 §15.5.8-9).
+    for c in 1..=9u8 {
+        pac::ADC1.smpr1().modify(|w| w.set_smp((c - 1) as usize, st));
+    }
+    pac::ADC1.smpr2().modify(|w| w.set_smp(0, st));
 
     pac::ADC1.cr().modify(|w| w.set_adstart(true));
     n
@@ -276,6 +278,100 @@ async fn heartbeat_task(mut led: Output<'static>) -> ! {
     loop {
         led.toggle();
         Timer::after_millis(500).await;
+    }
+}
+
+/// Светодиодная индикация состояния (ведутся атомарным флагом STATUS):
+/// LD5 (PE10) — USB-CDC подключён; LD6 (PE15) — идут кадры данных;
+/// LD10 (PE13) — тревога (overrun/потеря ACK), мигает и сама гаснет через ~4 с.
+#[embassy_executor::task]
+async fn led_task(
+    mut ld_usb: Output<'static>,
+    mut ld_data: Output<'static>,
+    mut ld_alarm: Output<'static>,
+) -> ! {
+    let mut tick = 0u32;
+    loop {
+        let st = STATUS.load(Ordering::Relaxed);
+        if st & ST_USB != 0 {
+            ld_usb.set_high();
+        } else {
+            ld_usb.set_low();
+        }
+        if st & ST_DATA != 0 {
+            ld_data.set_high();
+        } else {
+            ld_data.set_low();
+        }
+        if st & ST_ALARM != 0 {
+            if tick % 4 == 0 {
+                ld_alarm.set_high();
+            } else {
+                ld_alarm.set_low();
+            }
+            if tick >= 40 {
+                STATUS.fetch_and(!ST_ALARM, Ordering::Relaxed);
+            }
+        } else {
+            ld_alarm.set_low();
+        }
+        tick = (tick + 1) % 80;
+        Timer::after_millis(100).await;
+    }
+}
+
+/// Тестовый генератор сигналов: программная развёртка через DAC1_OUT1 (PA4).
+/// Такт 20 кГц (Timer::after_micros(50)), длительность периода 20 отсчётов =>
+/// фиксированная частота 1 кГц. Форма (биты [2:1] GEN_CFG) и амплитуда
+/// ([5:3], peak = 128*(n+1) кода ЛШИ) задаются командой 0xC0. LD7 (PE11)
+/// горит, пока генератор включён.
+#[embassy_executor::task]
+async fn generator_task(mut led_gen: Output<'static>) -> ! {
+    use embassy_stm32::pac;
+
+    const PHASES: usize = 20;
+    const HALF: usize = PHASES / 2;
+    // sin(2π·i/20)·2048, i=0..19 (одна таблица на период — фиксированная 1 кГц).
+    const SINE: [i32; PHASES] = [
+        0, 633, 1204, 1657, 1948, 2048, 1948, 1657, 1204, 633, 0, -633, -1204, -1657, -1948, -2048,
+        -1948, -1657, -1204, -633,
+    ];
+
+    let mut ph = 0usize;
+    loop {
+        let cfg = GEN_CFG.load(Ordering::Relaxed);
+        if cfg & 1 == 0 {
+            led_gen.set_low();
+            Timer::after_millis(50).await;
+            continue;
+        }
+        led_gen.set_high();
+        let shape = (cfg >> 1) & 0x3;
+        let amp = 128 * (((cfg >> 3) & 0x7) as i32 + 1);
+        let s = match shape {
+            1 => SINE[ph],
+            2 => {
+                let m = ph % HALF;
+                let tri = if m <= HALF / 2 {
+                    (m as i32 * 4096) / (HALF as i32 / 2)
+                } else {
+                    ((HALF as i32 - m as i32) * 4096) / (HALF as i32 / 2)
+                };
+                tri - 2048
+            }
+            3 => {
+                if ph < HALF {
+                    -2048
+                } else {
+                    2048
+                }
+            }
+            _ => 0,
+        };
+        let code = (2048 + s * amp / 2048).clamp(0, 4095);
+        pac::DAC1.dhr12r(0).modify(|w| w.set_dhr(code as u16));
+        ph = (ph + 1) % PHASES;
+        Timer::after_micros(50).await;
     }
 }
 
@@ -309,7 +405,10 @@ async fn data_task<'d>(
 
     loop {
         tx.wait_connection().await;
+        STATUS.fetch_or(ST_USB, Ordering::Relaxed);
         defmt::info!("USB host connected (DTR/RTS)");
+        let mut fs_frames: u64 = 0;
+        let mut fs_start = Instant::now();
         loop {
             let want = unsafe { core::ptr::read_volatile(scan_len).max(1) };
             match ring_buf.len() {
@@ -325,6 +424,9 @@ async fn data_task<'d>(
             }
 
             let ovr = embassy_stm32::pac::ADC1.isr().read().ovr();
+            if ovr {
+                STATUS.fetch_or(ST_ALARM, Ordering::Relaxed);
+            }
 
             let mut idx = 5usize;
             let mut nch = 0u8;
@@ -341,29 +443,45 @@ async fn data_task<'d>(
             frame[3] = seq;
             frame[4] = nch;
 
-            if ACK_PENDING.swap(false, Ordering::Relaxed) {
-                let cfgs = channel_snapshot();
-                let mut mask_lo = 0u8;
-                let mut mask_hi = 0u8;
-                for (i, c) in cfgs.iter().enumerate() {
-                    if c.enabled {
-                        if i < 8 { mask_lo |= 1 << i } else { mask_hi |= 1 << (i - 8) }
-                    }
+            let mut ack_failed = false;
+            while let Some(pkt) = with(|cs| ACK_QUEUE.borrow_ref_mut(cs).pop()) {
+                if tx.write_packet(&pkt.data[..pkt.len as usize]).await.is_err() {
+                    ack_failed = true;
+                    break;
                 }
-                let _ = tx.write_packet(&[DATA_SYNC[0], DATA_SYNC[1], STATUS_FRAME, seq, mask_lo, mask_hi]).await;
             }
+            if ack_failed {
+                STATUS.fetch_and(!(ST_USB | ST_DATA), Ordering::Relaxed);
+                break;
+            }
+
             if tx.write_packet(&frame[..idx]).await.is_err() {
+                STATUS.fetch_and(!(ST_USB | ST_DATA), Ordering::Relaxed);
                 break; // хост отвалился — переждём reconnect
+            }
+            STATUS.fetch_or(ST_DATA, Ordering::Relaxed);
+
+            fs_frames += 1;
+            let elapsed = fs_start.elapsed();
+            if elapsed.as_millis() >= 500 {
+                let us = elapsed.as_micros().max(1);
+                let fs = ((fs_frames * 1_000_000) / us) as u32;
+                fs_frames = 0;
+                fs_start = Instant::now();
+                let pkt = [ACK_FS, fs as u8, (fs >> 8) as u8, (fs >> 16) as u8, (fs >> 24) as u8];
+                if tx.write_packet(&pkt).await.is_err() {
+                    STATUS.fetch_and(!(ST_USB | ST_DATA), Ordering::Relaxed);
+                    break;
+                }
             }
         }
     }
 }
 
 /// Приём команд: живёт отдельно от потока, блокирующее read_packet здесь
-/// безопасно (поток кадров в своей задаче не стоит). Единственный ответ на
-/// 0xB2 — "статус-кадр" с тем же sync-префиксом 0xAA55, но с флагом bit6
-/// (STATUS_FRAME): [0xAA,0x55,0x40,seq,mask_lo,mask_hi]. Он идёт тем же
-/// IN-эндпоинтом, что и данные; десктоп различает типы по флагу.
+/// безопасно (поток кадров в своей задаче не стоит). Ответы (A1/B1/B3/D1)
+/// кладутся в ACK_QUEUE, а отправляет их единственный писатель IN-эндпоинта —
+/// data_task.
 async fn cmd_task<'d>(mut rx: Receiver<'d, Driver<'d, peripherals::USB>>, scan_len: *mut usize) -> ! {
     let mut buf = [0u8; 64];
     loop {
@@ -382,6 +500,7 @@ async fn cmd_task<'d>(mut rx: Receiver<'d, Driver<'d, peripherals::USB>>, scan_l
                 let level = buf[1].min(7);
                 adc_stop();
                 unsafe { core::ptr::write_volatile(scan_len, adc_write_sequence(level)) };
+                push_ack(&[ACK_RATE, level]);
             }
             CMD_SET_CHANNEL if n >= 4 => {
                 let ch = buf[1] as usize;
@@ -391,18 +510,22 @@ async fn cmd_task<'d>(mut rx: Receiver<'d, Driver<'d, peripherals::USB>>, scan_l
                     set_channel_cfg(ch, enable, st);
                     adc_stop();
                     unsafe { core::ptr::write_volatile(scan_len, adc_write_sequence(st)) };
+                    push_ack(&[ACK_CHANNEL, buf[1], buf[2], buf[3]]);
                 }
             }
             CMD_GET_MASK => {
-                // Единственный писатель IN-эндпоинта — data_task. Здесь лишь
-                // выставляем флаг; data_task вставит статус-кадр перед следующим
-                // кадровым пакетом. Это исключает гонку за ENDPOINT_IN.
-                ACK_PENDING.store(true, Ordering::Relaxed);
+                let cfgs = channel_snapshot();
+                let mut mask_lo = 0u8;
+                let mut mask_hi = 0u8;
+                for (i, c) in cfgs.iter().enumerate() {
+                    if c.enabled {
+                        if i < 8 { mask_lo |= 1 << i } else { mask_hi |= 1 << (i - 8) }
+                    }
+                }
+                push_ack(&[ACK_MASK, mask_lo, mask_hi]);
             }
-            CMD_ENTER_DFU => {
-                // Дать стеку USB дотянуть ACK до хоста перед ребутом.
-                Timer::after_millis(50).await;
-                enter_dfu_mode();
+            CMD_SET_GEN if n >= 2 => {
+                GEN_CFG.store(buf[1], Ordering::Relaxed);
             }
             _ => {}
         }
@@ -421,14 +544,15 @@ async fn cmd_task<'d>(mut rx: Receiver<'d, Driver<'d, peripherals::USB>>, scan_l
 
 #[embassy_executor::main]
 async fn main(spawner: Spawner) {
-    check_and_enter_bootloader();
-
     let mut config = Config::default();
     {
         use embassy_stm32::rcc::*;
+        // HSE 8 МГц подаётся в режиме Bypass с выхода MCO ST-LINK на PF0-OSC_IN
+        // (на плате нет кварца X2; конфигурация по умолчанию макета, см. UM1570
+        // §4.10.1 и Project/Demonstration/system_stm32f30x.c demo-прошивки ST).
         config.rcc.hse = Some(Hse {
             freq: mhz(8),
-            mode: HseMode::Oscillator,
+            mode: HseMode::Bypass,
         });
         config.rcc.pll = Some(Pll {
             src: PllSource::HSE,
@@ -448,6 +572,10 @@ async fn main(spawner: Spawner) {
 
 
     let led = Output::new(p.PE8, Level::Low, Speed::Low);
+    let ld_usb = Output::new(p.PE10, Level::Low, Speed::Low);
+    let ld_data = Output::new(p.PE15, Level::Low, Speed::Low);
+    let ld_alarm = Output::new(p.PE13, Level::Low, Speed::Low);
+    let ld_gen = Output::new(p.PE11, Level::Low, Speed::Low);
     // DMA-канал для ADC1: на STM32F3 (DMA v2 без DMAMUX) request ADC1 жёстко
     // привязан к каналу 1 контроллера DMA1.
     let adc_dma = Channel::new(p.DMA1_CH1, Irqs);
@@ -457,7 +585,7 @@ async fn main(spawner: Spawner) {
         use embassy_stm32::pac::gpio::vals::Moder;
 
         pac::GPIOA.moder().modify(|w| {
-            for pin in 0..4 {
+            for pin in 0..=4 {
                 w.set_moder(pin, Moder::ANALOG);
             }
         });
@@ -473,6 +601,17 @@ async fn main(spawner: Spawner) {
     }
 
     let scan_len = adc_write_sequence(2);
+
+    // DAC1 (тестовый генератор, PA4): такт APB1 + выходной буфер канала 1.
+    // Сдвиг выходного кода и форма — за генератором в generator_task.
+    {
+        use embassy_stm32::pac;
+        pac::RCC.apb1enr().modify(|w| w.set_dacen(true));
+        pac::DAC1.cr().modify(|w| {
+            w.set_boff(0, false);
+            w.set_en(0, true);
+        });
+    }
 
     let driver = Driver::new(p.USB, Irqs, p.PA12, p.PA11);
     let mut usb_config = embassy_usb::Config::new(0xc0de, 0xcafe);
@@ -508,9 +647,11 @@ async fn main(spawner: Spawner) {
     // (например, hard fault до входа в main). Если моргает, но данных нет —
     // проблема в USB-подключении, это видно по логу ниже.
     spawner.spawn(heartbeat_task(led).unwrap());
+    spawner.spawn(led_task(ld_usb, ld_data, ld_alarm).unwrap());
+    spawner.spawn(generator_task(ld_gen).unwrap());
     // Поток кадров и приём команд — независимые futures внутри join3.
     // Единственный Writer IN-эндпоинта — data_task; cmd_task общается с ней
-    // через ACK_PENDING (см. комментарий в cmd_task).
+    // через ACK_QUEUE (см. комментарий в cmd_task).
     defmt::info!("firmware up: waiting for USB host");
     join3(usb_fut, data_task(tx, adc_dma, sl), cmd_task(rx, sl)).await;
 }

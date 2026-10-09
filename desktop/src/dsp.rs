@@ -55,7 +55,9 @@ pub fn roll_to(y: &[f32], idx: usize) -> Vec<f32> {
 /// для несинхронизированной дискретизации).
 pub fn hann(n: usize) -> Vec<f32> {
     (0..n)
-        .map(|i| 0.5 - 0.5 * (std::f64::consts::TAU * i as f64 / (n - 1).max(1) as f64) as f32)
+        .map(|i| {
+            (0.5 - 0.5 * (std::f64::consts::TAU * i as f64 / (n - 1).max(1) as f64).cos()) as f32
+        })
         .collect()
 }
 
@@ -164,7 +166,7 @@ pub fn measure_z(v: &[f32], i_ch: &[f32], f_hz: f32, fs: f32, r_sense: f64) -> I
     // V/I как комплексные числа: (vc + j·vs)/(ic + j·is) · R_sense
     let den = ic * ic + is_ * is_;
     let re = (vc * ic + vs * is_) / den;
-    let im = (vs * ic - vc * is_) / den;
+    let im = (vc * is_ - vs * ic) / den;
     Impedance { re: re * r_sense, im: im * r_sense }
 }
 

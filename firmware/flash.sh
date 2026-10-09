@@ -4,7 +4,7 @@ set -e
 echo "Building firmware..."
 cargo build --release
 
-# target — thumbv7em-none-eabi (без eabihf: у STM32F303 нет FPU)
+# target — thumbv7em-none-eabi (soft-float; FPU у STM32F303 есть, но в прошивке не используется)
 ELF="target/thumbv7em-none-eabi/release/ocd-stm32f3"
 BIN="target/firmware.bin"
 
@@ -17,10 +17,11 @@ fi
 arm-none-eabi-objcopy -O binary "$ELF" "$BIN"
 
 # Как попасть в bootloader-режим (DFU):
-#   вариант 1: аппаратно — замкнуть BOOT0 (перемычка JP1) на VDD и нажать RESET;
-#   вариант 2: программно — прошивка сама сбрасывается в DFU по команде из UI
-#              (вкладка System -> Enter DFU), после этого устройство само
-#              перестроится как "STM32 BOOTLOADER".
+#   аппаратно: перевести BOOT0 в 1 (паяльный мост SB19) и нажать RESET (B2).
+#   По умолчанию SB19 разомкнут, BOOT0 подтянут к GND (510 Ом) — старт из
+#   основной flash. Программной команды входа в DFU в прошивке НЕТ: по RM0316
+#   режим загрузки на STM32F3 определяется состоянием пина BOOT0 при сбросе
+#   и не переключается регистром SYSCFG_MEMRMP.
 echo "Waiting for DFU device (Ctrl-C чтобы отменить)..."
 until lsusb | grep -q "0483:df11"; do sleep 0.5; done
 echo "DFU device found."
