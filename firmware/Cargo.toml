@@ -2,7 +2,6 @@
 edition = "2021"
 name = "ocd-stm32f3"
 version = "0.1.0"
-license = "MIT OR Apache-2.0"
 
 # Все embassy-* закреплены на ОДИН тег embassy-stm32-v0.6.0 (commit 84444a19).
 # Это актуальная стабильная линейка: embassy-stm32 0.6.0, executor 0.10.0,
@@ -51,6 +50,9 @@ embedded-hal = "1.0.0"
 # сам crate нужен в зависимостях напрямую, чтобы `use critical_section::...` резолвился.
 critical-section = "1.1"
 heapless = { version = "0.9", default-features = false }
+# пытаюсь починить ошибку сборки для библиотеки serde
+serde = { version = "1", features = ["derive"], default-features = false }
+
 
 # probe-rs читает DWARF из .elf, чтобы показывать дефmt-логи и стектрейсы.
 # По умолчанию release stripped=none уже оставляет отладочную информацию,
@@ -60,10 +62,6 @@ heapless = { version = "0.9", default-features = false }
 debug = 2
 strip = false
 
-[[bin]]
-name = "ocd-stm32f3"
-path = "src/main.rs"
-
-[[bin]]
-name = "test_usb"
-path = "src/test_usb.rs"
+#[[bin]]
+#name = "test_usb"
+#path = "src/test_usb.rs"
