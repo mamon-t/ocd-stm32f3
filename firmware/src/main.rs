@@ -68,7 +68,10 @@ bind_interrupts!(struct Irqs {
 //                     3=меандр), биты[5:3]=амплитуда 0..7 (peak=128*(n+1) кода)
 // ACK MCU->PC:      0xA1 <level> | 0xB1 <ch> <en> <st> | 0xB3 <mask_lo> <mask_hi>
 //                   периодически 0xA4 <fs:u32 LE> — измеренный темп сканов (Гц)
-const DMA_BUF_SIZE: usize = 512;
+// Размер DMA-кольца в отсчётах (u16). set_alignment(scan_len) требует, чтобы
+// вместимость кольца делилась на длину скана без остатка, а scan_len меняется
+// от 1 до 10 (по числу включённых каналов). Поэтому берём НОК(1..=10)=2520.
+const DMA_BUF_SIZE: usize = 2520;
 const NUM_CHANNELS: usize = 10;
 // ADC1 (RM0316 §15.5): регистр данных DATA[15:0] на смещении 0x40
 // (0x00 ISR, 0x04 IER, 0x08 CR, 0x0C CFGR, 0x14 SMPR1, 0x18 SMPR2,
@@ -188,10 +191,15 @@ fn set_channel_cfg(ch: usize, enable: bool, st: u8) {
 fn adc_write_sequence(sample_time: u8) -> usize {
     use embassy_stm32::pac;
     use embassy_stm32::pac::adc::vals::{Advregen, Align, Dmacfg, Res, SampleTime};
+    use embassy_stm32::pac::rcc::vals::Adcpres;
 
     let st: SampleTime = unsafe { core::mem::transmute(sample_time_from_u8(sample_time)) };
 
     pac::RCC.ahbenr().modify(|w| w.set_adc12en(true));
+    // RCC_CFGR2.ADCPRE12 задаёт аналоговую тактовую ADC (ADCCLK). Без неё
+    // калибровка (AD_CAL) не завершается: ADRDY не взводится и main виснет.
+    // ADCCLK = PLLCLK / 2 = 36 МГц.
+    pac::RCC.cfgr2().modify(|w| w.set_adc12pres(Adcpres::DIV2));
     pac::ADC1.cr().modify(|w| w.set_advregen(Advregen::INTERMEDIATE));
     cortex_m::asm::delay(720);
     pac::ADC1.cr().modify(|w| w.set_advregen(Advregen::ENABLED));
@@ -202,7 +210,9 @@ fn adc_write_sequence(sample_time: u8) -> usize {
     cortex_m::asm::delay(100);
     pac::ADC1.isr().write(|w| w.set_adrdy(true));
     pac::ADC1.cr().modify(|w| w.set_aden(true));
+    defmt::info!("adc: wait adrdy");
     while !pac::ADC1.isr().read().adrdy() {}
+    defmt::info!("adc: adrdy ok");
 
     pac::ADC1.cfgr().modify(|w| {
         w.set_res(Res::BITS12);
@@ -256,6 +266,7 @@ fn adc_write_sequence(sample_time: u8) -> usize {
     pac::ADC1.smpr2().modify(|w| w.set_smp(0, st));
 
     pac::ADC1.cr().modify(|w| w.set_adstart(true));
+    defmt::info!("adc: adstart set n={}", n);
     n
 }
 
@@ -263,6 +274,13 @@ fn adc_stop() {
     use embassy_stm32::pac;
     pac::ADC1.cr().modify(|w| w.set_adstp(true));
     while pac::ADC1.cr().read().adstp() {}
+    defmt::info!("adc_stop: adstp done");
+    // На STM32F3 выключение ADC — это командный бит ADDIS, а не сброс ADEN
+    // (RM0316 §15.4.7: ADEN снимается аппаратно, пока ADDIS=1). Простая запись
+    // ADEN=0 игнорируется, и `while aden()` зависает навсегда.
+    pac::ADC1.cr().modify(|w| w.set_addis(true));
+    while pac::ADC1.cr().read().aden() {}
+    defmt::info!("adc_stop: aden cleared");
 }
 
 // ---------------------------------------------------------------------------
@@ -398,6 +416,12 @@ async fn data_task<'d>(
     };
     ring_buf.set_alignment(unsafe { core::ptr::read_volatile(scan_len).max(1) });
     ring_buf.start();
+    defmt::info!(
+        "DMA ring started: cap={} align={} scan_len={}",
+        DMA_BUF_SIZE,
+        unsafe { core::ptr::read_volatile(scan_len).max(1) },
+        unsafe { core::ptr::read_volatile(scan_len) }
+    );
 
     let mut seq: u8 = 0;
     let mut scan_buf = [0u16; NUM_CHANNELS];
@@ -408,18 +432,23 @@ async fn data_task<'d>(
         STATUS.fetch_or(ST_USB, Ordering::Relaxed);
         defmt::info!("USB host connected (DTR/RTS)");
         let mut fs_frames: u64 = 0;
+        let mut frames_sent: u64 = 0;
+        let mut last_status = Instant::now();
         let mut fs_start = Instant::now();
         loop {
             let want = unsafe { core::ptr::read_volatile(scan_len).max(1) };
-            match ring_buf.len() {
-                Ok(available) if available >= want => {}
-                _ => {
-                    Timer::after_micros(100).await;
-                    continue;
-                }
+            let avail = ring_buf.len();
+            if last_status.elapsed().as_millis() >= 500 {
+                defmt::info!("dt: avail={:?} want={} sent={}", avail, want, frames_sent);
+                last_status = Instant::now();
             }
+            // read_latest() сам чинит Overrun: при переполнении указатель чтения
+            // догоняет запись и отдаёт ТОЛЬКО свежий скан (embassy-stm32
+            // dma/ringbuffer). Прежний код на Err(Overrun) лишь спал, не сливая
+            // кольцо → поток данных стоял намертво (avail=Err(Overrun) вечно).
             let got = ring_buf.read_latest(&mut scan_buf[..want]);
             if got < want {
+                Timer::after_micros(100).await;
                 continue;
             }
 
@@ -452,14 +481,17 @@ async fn data_task<'d>(
             }
             if ack_failed {
                 STATUS.fetch_and(!(ST_USB | ST_DATA), Ordering::Relaxed);
+                defmt::info!("dt: ack write error, break");
                 break;
             }
 
             if tx.write_packet(&frame[..idx]).await.is_err() {
                 STATUS.fetch_and(!(ST_USB | ST_DATA), Ordering::Relaxed);
-                break; // хост отвалился — переждём reconnect
+                defmt::info!("dt: frame write error, break"); // хост отвалился — переждём reconnect
+                break;
             }
             STATUS.fetch_or(ST_DATA, Ordering::Relaxed);
+            frames_sent += 1;
 
             fs_frames += 1;
             let elapsed = fs_start.elapsed();
@@ -495,11 +527,15 @@ async fn cmd_task<'d>(mut rx: Receiver<'d, Driver<'d, peripherals::USB>>, scan_l
         if n == 0 {
             continue;
         }
+        defmt::info!("cmd: {:02x} n={}", buf[0], n);
         match buf[0] {
             CMD_SET_RATE if n >= 2 => {
                 let level = buf[1].min(7);
+                defmt::info!("set_rate: begin st={}", level);
                 adc_stop();
+                defmt::info!("set_rate: stopped, reconfig");
                 unsafe { core::ptr::write_volatile(scan_len, adc_write_sequence(level)) };
+                defmt::info!("set_rate: reconfigured, push ack");
                 push_ack(&[ACK_RATE, level]);
             }
             CMD_SET_CHANNEL if n >= 4 => {
@@ -613,6 +649,12 @@ async fn main(spawner: Spawner) {
         });
     }
 
+    // У F303 (usb_v1) нет программного DPPU: подтяжка D+ внешняя и всегда
+    // активна, поэтому сброс МКУ не даёт разрыва линии и хост не
+    // пере-энумерирует. Принудительно разрываем D+ перед инициализацией USB,
+    // чтобы после каждой прошивки/сброса хост видел чистое подключение.
+    force_usb_disconnect();
+
     let driver = Driver::new(p.USB, Irqs, p.PA12, p.PA11);
     let mut usb_config = embassy_usb::Config::new(0xc0de, 0xcafe);
     usb_config.manufacturer = Some("Embassy");
@@ -621,8 +663,11 @@ async fn main(spawner: Spawner) {
 
     let mut config_descriptor = [0; 256];
     let mut bos_descriptor = [0; 256];
-    // CDC требует control_buf >= 7 (assert в CdcAcmClass::new).
-    let mut control_buf = [0; 7];
+    // control_buf должен вмещать СТРОКОВЫЕ дескрипторы USB
+    // (manufacturer/product/serial), а не только SETUP-пакеты. При 7 байтах
+    // десериализация string-дескриптора паникует ("control buffer too small",
+    // embassy-usb/src/lib.rs:758) и control-endpoint намертво виснет.
+    let mut control_buf = [0; 128];
     let mut state = State::new();
 
     let mut builder = Builder::new(
@@ -654,4 +699,16 @@ async fn main(spawner: Spawner) {
     // через ACK_QUEUE (см. комментарий в cmd_task).
     defmt::info!("firmware up: waiting for USB host");
     join3(usb_fut, data_task(tx, adc_dma, sl), cmd_task(rx, sl)).await;
+}
+
+// Принудительный разрыв D+: PA12 ведём как выход и держим в 0 ~250 мс, затем
+// отпускаем (вход → линию снова поднимает внешняя подтяжка). Нужно потому, что
+// у usb_v1 (F303) нет программного soft-disconnect.
+fn force_usb_disconnect() {
+    use embassy_stm32::pac::{gpio::vals::Moder, GPIOA};
+    GPIOA.moder().modify(|w| w.set_moder(12, Moder::OUTPUT));
+    GPIOA.bsrr().write(|w| w.set_br(12, true));
+    cortex_m::asm::delay(72_000_000 / 1000 * 250);
+    GPIOA.moder().modify(|w| w.set_moder(12, Moder::INPUT));
+    cortex_m::asm::delay(72_000_000 / 1000 * 50);
 }

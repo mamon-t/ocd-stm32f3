@@ -6,18 +6,19 @@ mod dsp;
 mod transport;
 
 use std::rc::Rc;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::time::{Duration, Instant};
 
 // --- Явные импорты для gpui-kit 0.7.1 ---
 use gpui_kit::base::Selectable;
 use gpui_kit::component::{
-    button::Button, chart::LineChart, h_flex, label::Label, separator::Separator, v_flex,
+    button::Button, h_flex, label::Label, separator::Separator, v_flex,
 };
 use gpui_kit::*;
 
 use serde::Deserialize;
 
-use canvas::TraceCanvas;
+use canvas::{channel_color, PlotCanvas, TraceCanvas, UNIT_V};
 use transport::Transport;
 
 /// Максимум точек на канал в кольцевом буфере осциллографа.
@@ -27,7 +28,40 @@ const SIM_FS: f32 = 72_000.0;
 /// Период опроса транспорта/симулятора в UI-потоке.
 const PUMP_INTERVAL: Duration = Duration::from_millis(33);
 
-#[derive(Clone, Copy, PartialEq, Deserialize)]
+// --- Палитра GUI: строгий «серо-стальной» приборный стиль ---
+const C_BG: u32 = 0x14171c; // фон окна
+const C_PANEL: u32 = 0x2a2f37; // панели (серо-сталь)
+const C_PANEL_HI: u32 = 0x343b45; // панели, верхний уровень
+const C_BORDER: u32 = 0x454c57; // разделители/границы
+const C_TEXT: u32 = 0xe6e9ee; // контрастный текст
+const C_MUTED: u32 = 0x99a3ae; // приглушённый текст
+const C_ACCENT: u32 = 0x4d9de0; // акцентный синий
+const C_OFF: u32 = 0x555d68; // «выключено» (серый)
+const C_TRIG: u32 = 0xe0a24d; // цвет метки триггера
+
+/// Шаг сетки развёртки (мс/дел), от 10 мкс до 5 мс.
+const TIME_DIVS: [f32; 9] = [0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0];
+/// Шаг сетки по вертикали (В/дел), от 50 мВ до 10 В.
+const V_DIVS: [f32; 8] = [0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0, 10.0];
+
+/// Индекс ближайшего значения в таблице делений.
+fn nearest_idx(arr: &[f32], cur: f32) -> usize {
+    let mut best = 0usize;
+    let mut best_d = f32::INFINITY;
+    for (i, &v) in arr.iter().enumerate() {
+        let d = (v - cur).abs();
+        if d < best_d {
+            best_d = d;
+            best = i;
+        }
+    }
+    best
+}
+
+/// Счётчик тактов pump для периодической диагностики (раз в ~1 c).
+static PUMP_TICKS: AtomicU64 = AtomicU64::new(0);
+
+#[derive(Clone, Copy, PartialEq, Debug, Deserialize)]
 enum Tab {
     Scope,
     Spectrum,
@@ -54,6 +88,8 @@ pub struct LabApp {
     ch_enabled: [bool; 10],
     trigger_on: bool,
     time_div_ms: f32,
+    /// Вертикальный масштаб, вольт на деление.
+    v_per_div: f32,
 
     // --- состояние устройства ---
     last_seq: Option<u8>,
@@ -104,6 +140,7 @@ impl LabApp {
             ch_enabled: [true, true, false, false, false, false, false, false, false, false],
             trigger_on: true,
             time_div_ms: 1.0,
+            v_per_div: 0.5,
             last_seq: None,
             lost_frames: 0,
             spec_freqs: Rc::new(vec![]),
@@ -144,6 +181,7 @@ impl LabApp {
             }
         }
 
+        let n_events = events.len();
         for ev in events {
             got_any = true;
             match ev {
@@ -237,6 +275,20 @@ impl LabApp {
             }
             cx.notify();
         }
+
+        let tick = PUMP_TICKS.fetch_add(1, Ordering::Relaxed);
+        if tick % 30 == 0 {
+            eprintln!(
+                "[labbench] pump tick={} frame_count={} events/tick={} got_any={} queue_len={} transport={} status={:?}",
+                tick,
+                self.frame_count,
+                n_events,
+                got_any,
+                self.transport.as_ref().map(|t| t.queue_len()).unwrap_or(0),
+                self.transport.is_some(),
+                self.status_line,
+            );
+        }
     }
 
     fn push_frame(&mut self, channels: &[(u8, u16)]) {
@@ -303,10 +355,19 @@ impl LabApp {
     }
 
     fn visible_channels(&self) -> Vec<Rc<Vec<f32>>> {
+        // Окно отображения: 10 делений по `time_div_ms`.
+        let fs = self.fs_hz.max(1.0);
+        let win = ((self.time_div_ms * 10.0) * fs / 1000.0).round() as usize;
+        let win = win.clamp(16, RING_LEN);
         let mut out = Vec::new();
         for ch in 0..10 {
             if self.ch_enabled[ch] {
                 let raw = self.channel_slice(ch);
+                let raw = if raw.len() > win {
+                    Rc::new(raw[raw.len() - win..].to_vec())
+                } else {
+                    raw
+                };
                 let data = if self.trigger_on && out.is_empty() {
                     match dsp::find_trigger(&raw, 0.0, 0.05) {
                         Some(idx) => Rc::new(dsp::roll_to(&raw, idx)),
@@ -324,28 +385,47 @@ impl LabApp {
         out
     }
 
+    /// Сдвинуть горизонтальную развёртку на один шаг (dir: −1 медленнее, +1 быстрее).
+    fn step_time_div(&mut self, dir: i32) {
+        let i = nearest_idx(&TIME_DIVS, self.time_div_ms) as i32;
+        let ni = (i + dir).clamp(0, TIME_DIVS.len() as i32 - 1) as usize;
+        self.time_div_ms = TIME_DIVS[ni];
+    }
+
+    /// Сдвинуть вертикальный делитель на один шаг (dir: −1 меньше В/дел, +1 больше).
+    fn step_v_div(&mut self, dir: i32) {
+        let i = nearest_idx(&V_DIVS, self.v_per_div) as i32;
+        let ni = (i + dir).clamp(0, V_DIVS.len() as i32 - 1) as usize;
+        self.v_per_div = V_DIVS[ni];
+    }
+
     fn render_scope(&self, _cx: &Context<Self>) -> AnyElement {
         let chans = self.visible_channels();
-        let fs = self.fs_hz;
 
         let mut header = h_flex()
+            .w_full()
             .gap_4()
             .items_center()
-            .child(Label::new(format!("{:.1} ms/div", self.time_div_ms)))
-            .child(Label::new(format!("fs = {:.0} Гц", fs)))
-            .child(Label::new(format!("{:.0} fps", self.fps)));
+            .child(Label::new(format!("{:.1} мс/дел", self.time_div_ms)).text_color(rgb(C_TEXT)))
+            .child(
+                Label::new(if self.trigger_on { "триггер: вкл" } else { "триггер: выкл" })
+                    .text_color(rgb(C_MUTED)),
+            )
+            .child(div().flex_1())
+            .child(Label::new(format!("каналов: {}", chans.len())).text_color(rgb(C_MUTED)));
         if self.lost_frames > 0 {
-            header = header.child(Label::new(format!("lost {}", self.lost_frames)));
-        }
-        if self.trigger_on {
-            header = header.child(Label::new("trig"));
+            header = header.child(
+                Label::new(format!("потеряно {}", self.lost_frames)).text_color(rgb(C_ACCENT)),
+            );
         }
 
         h_flex()
             .size_full()
+            .items_stretch()
             .child(
                 v_flex()
                     .flex_1()
+                    .h_full()
                     .gap_2()
                     .child(header)
                     .child(
@@ -354,36 +434,56 @@ impl LabApp {
                             .flex_1()
                             .w_full()
                             .overflow_hidden()
-                            .child(TraceCanvas::new(chans).trigger_level(if self.trigger_on {
-                                Some(0.0)
-                            } else {
-                                None
-                            })),
+                            .child(
+                                TraceCanvas::new(chans)
+                                    .trigger_level(if self.trigger_on {
+                                        Some(0.0)
+                                    } else {
+                                        None
+                                    })
+                                    .v_per_div(self.v_per_div)
+                                    .time_per_div_ms(self.time_div_ms),
+                            ),
                     ),
             )
             .into_any_element()
     }
 
     fn render_spectrum(&self, _cx: &Context<Self>) -> AnyElement {
-        let points: Vec<(SharedString, f32)> = self
+        let points: Vec<(f32, f32)> = self
             .spec_freqs
             .iter()
             .zip(self.spec_dbs.iter())
-            .map(|(&f, &db)| (format!("{f:.0}").into(), db))
+            .map(|(&f, &db)| (f, db))
             .collect();
+        let x_fmt: Rc<dyn Fn(f32) -> String> = Rc::new(|f: f32| {
+            if f >= 1000.0 {
+                format!("{:.0}k", f / 1000.0)
+            } else {
+                format!("{f:.0}")
+            }
+        });
+        let y_fmt: Rc<dyn Fn(f32) -> String> = Rc::new(|db: f32| format!("{db:.0}"));
 
         h_flex()
             .size_full()
+            .items_stretch()
             .child(
                 v_flex()
                     .flex_1()
+                    .h_full()
                     .gap_2()
                     .child(
                         h_flex()
+                            .w_full()
                             .gap_4()
                             .items_center()
-                            .child(Label::new(format!("fs = {:.0} Гц", self.fs_hz)))
-                            .child(Label::new(format!("{:.0} fps", self.fps))),
+                            .child(Label::new("СПЕКТР").text_color(rgb(C_TEXT)))
+                            .child(div().flex_1())
+                            .child(
+                                Label::new(format!("fs = {:.0} Гц", self.fs_hz))
+                                    .text_color(rgb(C_MUTED)),
+                            ),
                     )
                     .child(
                         div()
@@ -392,14 +492,8 @@ impl LabApp {
                             .w_full()
                             .overflow_hidden()
                             .child(
-                                LineChart::new(points)
-                                    .id("spectrum-chart")
-                                    .x(|(f, _)| f.clone())
-                                    .y(|(_, db)| *db)
-                                    .natural()
-                                    .x_axis(true)
-                                    .y_axis(true)
-                                    .grid(true),
+                                PlotCanvas::new(points, x_fmt, y_fmt)
+                                    .line_color(rgb(C_ACCENT).into()),
                             ),
                     ),
             )
@@ -407,34 +501,53 @@ impl LabApp {
     }
 
     fn render_lcr(&self, _cx: &Context<Self>) -> AnyElement {
+        let header = h_flex()
+            .w_full()
+            .gap_4()
+            .items_center()
+            .child(Label::new("LCR-МЕТР").text_color(rgb(C_TEXT)))
+            .child(div().flex_1())
+            .child(Label::new(format!("fs = {:.0} Гц", self.fs_hz)).text_color(rgb(C_MUTED)));
+
         let body = match self.lcr_result {
             Some((z, val, unit, freq)) => v_flex()
                 .items_start()
-                .gap_4()
-                .child(Label::new(format!("Частота теста: {freq:.0} Гц")))
+                .gap_3()
+                .child(
+                    Label::new(format!("Частота теста: {freq:.0} Гц")).text_color(rgb(C_MUTED)),
+                )
                 .child(Separator::horizontal())
                 .child(
                     h_flex()
-                        .gap_4()
+                        .gap_3()
                         .items_center()
-                        .child(Label::new("Z:"))
-                        .child(Label::new(format!("{val:.2} {unit}"))),
+                        .child(Label::new("|Z|:").text_color(rgb(C_MUTED)))
+                        .child(Label::new(format!("{val:.2} {unit}")).text_color(rgb(C_TEXT))),
                 )
                 .child(
                     h_flex()
-                        .gap_4()
+                        .gap_3()
                         .items_center()
-                        .child(Label::new("R+jX:"))
-                        .child(Label::new(format!("{:.3} + j{:.3} Ом", z.re, z.im))),
+                        .child(Label::new("R + jX:").text_color(rgb(C_MUTED)))
+                        .child(
+                            Label::new(format!("{:.3} + j{:.3} Ом", z.re, z.im))
+                                .text_color(rgb(C_TEXT)),
+                        ),
                 )
-                .child(Label::new(&self.status_line)),
+                .child(Label::new(&self.status_line).text_color(rgb(C_MUTED))),
             None => v_flex()
+                .size_full()
                 .items_center()
                 .justify_center()
-                .child(Label::new("Ожидание данных LCR…")),
+                .child(Label::new("Ожидание данных LCR…").text_color(rgb(C_MUTED))),
         };
 
-        h_flex().size_full().child(body).into_any_element()
+        v_flex()
+            .size_full()
+            .gap_3()
+            .child(header)
+            .child(div().flex_1().w_full().child(body))
+            .into_any_element()
     }
 
     fn render_transient(&self, _cx: &Context<Self>) -> AnyElement {
@@ -453,24 +566,48 @@ impl LabApp {
             }
         };
 
-        let points: Vec<(SharedString, f32)> = data
+        let points: Vec<(f32, f32)> = data
             .iter()
             .enumerate()
-            .map(|(i, &v)| (format!("{i}").into(), v))
+            .map(|(i, &v)| (i as f32, v))
             .collect();
+        let fs = self.fs_hz.max(1.0);
+        let x_fmt: Rc<dyn Fn(f32) -> String> = Rc::new(move |i: f32| {
+            let us = i / fs * 1e6;
+            if us >= 1000.0 {
+                format!("{:.1}мс", us / 1000.0)
+            } else {
+                format!("{us:.0}мкс")
+            }
+        });
+        let y_fmt: Rc<dyn Fn(f32) -> String> = Rc::new(|v: f32| format!("{:.2}", v * UNIT_V));
 
         h_flex()
             .size_full()
+            .items_stretch()
             .child(
                 v_flex()
                     .flex_1()
+                    .h_full()
                     .gap_2()
                     .child(
                         h_flex()
+                            .w_full()
                             .gap_4()
                             .items_center()
-                            .child(Label::new(format!("Rise time 10–90%: {tr:.3} мкс")))
-                            .child(Label::new(format!("{:.0} fps", self.fps))),
+                            .child(Label::new("ПЕРЕХОДНЫЙ ПРОЦЕСС").text_color(rgb(C_TEXT)))
+                            .child(
+                                Label::new(format!("Rise 10–90%: {tr:.3} мкс"))
+                                    .text_color(rgb(C_ACCENT)),
+                            )
+                            .child(div().flex_1())
+                            .child(
+                                Label::new(format!("fs = {:.0} Гц", self.fs_hz))
+                                    .text_color(rgb(C_MUTED)),
+                            )
+                            .child(
+                                Label::new(format!("{:.0} fps", self.fps)).text_color(rgb(C_MUTED)),
+                            ),
                     )
                     .child(
                         div()
@@ -479,11 +616,8 @@ impl LabApp {
                             .w_full()
                             .overflow_hidden()
                             .child(
-                                LineChart::new(points)
-                                    .id("transient-chart")
-                                    .x(|(x, _)| x.clone())
-                                    .y(|(_, v)| *v)
-                                    .natural(),
+                                PlotCanvas::new(points, x_fmt, y_fmt)
+                                    .line_color(channel_color(2)),
                             ),
                     )
                     .child(Label::new(&self.status_line)),
@@ -491,9 +625,11 @@ impl LabApp {
             .into_any_element()
     }
 
-    fn tab_button(&self, cx: &mut Context<Self>, label: &'static str, tab: Tab) -> Button {
-        Button::new(label)
-            .label(label)
+    /// Пиктограмма-вкладка; полное имя режима показывается в тулбаре.
+    fn tab_button(&self, cx: &mut Context<Self>, glyph: &'static str, title: &'static str, tab: Tab) -> Button {
+        Button::new(glyph)
+            .label(glyph)
+            .tooltip(title)
             .selected(self.tab == tab)
             .on_click(cx.listener(move |this, _, _, cx| {
                 this.tab = tab;
@@ -501,15 +637,237 @@ impl LabApp {
             }))
     }
 
-    fn render_tab_bar(&self, cx: &mut Context<Self>) -> AnyElement {
+    /// Русское имя активного режима для заголовка тулбара.
+    fn tab_title(&self) -> &'static str {
+        match self.tab {
+            Tab::Scope => "ОСЦИЛЛОГРАФ",
+            Tab::Spectrum => "СПЕКТР",
+            Tab::Lcr => "LCR-МЕТР",
+            Tab::Transient => "ПЕРЕХОДНЫЙ ПРОЦЕСС",
+        }
+    }
+
+    /// Размах сигнала канала в вольтах (по всему кольцевому буферу).
+    fn channel_vpp(&self, ch: usize) -> f32 {
+        let r = &self.rings[ch];
+        let mut lo = f32::INFINITY;
+        let mut hi = f32::NEG_INFINITY;
+        for &v in r.iter() {
+            if v < lo {
+                lo = v;
+            }
+            if v > hi {
+                hi = v;
+            }
+        }
+        if lo.is_finite() && hi.is_finite() {
+            (hi - lo) * UNIT_V
+        } else {
+            0.0
+        }
+    }
+
+    /// Включить/выключить канал и передать маску устройству.
+    fn toggle_channel(&mut self, ch: usize, cx: &mut Context<Self>) {
+        let en = !self.ch_enabled[ch];
+        self.ch_enabled[ch] = en;
+        if en {
+            self.dev_mask |= 1 << ch;
+        } else {
+            self.dev_mask &= !(1 << ch);
+        }
+        if let Some(t) = &self.transport {
+            t.set_channel(ch as u8, en, 2);
+        }
+        cx.notify();
+    }
+
+    /// Верхняя панель: название прибора, вкладки, статус линии.
+    fn render_toolbar(&self, cx: &mut Context<Self>) -> AnyElement {
+        let link_ok = self.transport.is_some();
+        let status = h_flex()
+            .gap_4()
+            .items_center()
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(
+                        div()
+                            .w(px(8.))
+                            .h(px(8.))
+                            .rounded(px(4.))
+                            .bg(if link_ok { rgb(C_ACCENT) } else { rgb(C_BORDER) }),
+                    )
+                    .child(
+                        Label::new(if link_ok { "USB: линия" } else { "USB: нет" })
+                            .text_color(rgb(C_MUTED)),
+                    ),
+            )
+            .child(Label::new(format!("fs {:.0} Гц", self.fs_hz)).text_color(rgb(C_MUTED)))
+            .child(Label::new(format!("{:.0} fps", self.fps)).text_color(rgb(C_MUTED)))
+            .child(Label::new(format!("потеряно {}", self.lost_frames)).text_color(rgb(C_MUTED)));
+
         h_flex()
+            .w_full()
+            .px_3()
+            .py_2()
+            .gap_3()
+            .items_center()
+            .bg(rgb(C_PANEL_HI))
+            .border_b_1()
+            .border_color(rgb(C_BORDER))
+            .child(
+                h_flex()
+                    .gap_2()
+                    .items_center()
+                    .child(div().w(px(9.)).h(px(9.)).rounded(px(2.)).bg(rgb(C_ACCENT)))
+                    .child(Label::new("РЕЖИМ").text_color(rgb(C_MUTED)))
+                    .child(Label::new(self.tab_title()).text_color(rgb(C_TEXT))),
+            )
+            .child(div().w(px(1.)).h(px(20.)).bg(rgb(C_BORDER)))
+            .child(
+                h_flex()
+                    .gap_1()
+                    .items_center()
+                    .child(self.tab_button(cx, "∿", "Осциллограф", Tab::Scope))
+                    .child(self.tab_button(cx, "≡", "Спектр", Tab::Spectrum))
+                    .child(self.tab_button(cx, "Ω", "LCR", Tab::Lcr))
+                    .child(self.tab_button(cx, "↗", "Переходный", Tab::Transient)),
+            )
+            .child(div().flex_1())
+            .child(status)
+            .into_any_element()
+    }
+
+    /// Левая панель каналов: маркер цвета, вкл/выкл канала.
+    fn render_channel_panel(&self, cx: &mut Context<Self>) -> AnyElement {
+        let mut panel = v_flex()
+            .w(px(210.))
+            .h_full()
+            .bg(rgb(C_PANEL))
+            .border_r_1()
+            .border_color(rgb(C_BORDER))
             .p_2()
             .gap_1()
-            .items_center()
-            .child(self.tab_button(cx, "Oscilloscope", Tab::Scope))
-            .child(self.tab_button(cx, "Spectrum", Tab::Spectrum))
-            .child(self.tab_button(cx, "LCR", Tab::Lcr))
-            .child(self.tab_button(cx, "Transient", Tab::Transient))
+            .child(Label::new("КАНАЛЫ").text_color(rgb(C_MUTED)));
+
+        for ch in 0..10usize {
+            let enabled = self.ch_enabled[ch];
+            let vpp = if enabled { self.channel_vpp(ch) } else { 0.0 };
+            let row = h_flex()
+                .w_full()
+                .px_1()
+                .gap_2()
+                .items_center()
+                .rounded(px(3.))
+                .bg(if enabled { rgb(C_PANEL_HI) } else { rgb(C_PANEL) })
+                .child(
+                    div()
+                        .id(format!("ch-mark-{ch}"))
+                        .w(px(8.))
+                        .h(px(16.))
+                        .rounded(px(2.))
+                        .bg(if enabled { channel_color(ch) } else { rgb(C_OFF).into() })
+                        .on_click(cx.listener(move |this, _, _, cx| this.toggle_channel(ch, cx))),
+                )
+                .child(
+                    Label::new(format!("CH{ch}"))
+                        .text_color(if enabled { rgb(C_TEXT) } else { rgb(C_MUTED) }),
+                )
+                .child(div().flex_1())
+                .child(Label::new(format!("{vpp:.2}В")).text_color(rgb(C_MUTED)))
+                .child(
+                    Button::new(format!("ch-toggle-{ch}"))
+                        .label(if enabled { "●" } else { "○" })
+                        .compact()
+                        .selected(enabled)
+                        .on_click(cx.listener(move |this, _, _, cx| this.toggle_channel(ch, cx))),
+                );
+            panel = panel.child(row);
+        }
+
+        let t = self.time_div_ms;
+        let t_str = if t < 1.0 {
+            format!("{:.0} мкс", t * 1000.0)
+        } else {
+            format!("{t:.1} мс")
+        };
+        let v = self.v_per_div;
+        let v_str = if v < 1.0 {
+            format!("{:.0} мВ", v * 1000.0)
+        } else {
+            format!("{v:.0} В")
+        };
+
+        panel
+            .child(div().h(px(8.)))
+            .child(div().w_full().h(px(1.)).bg(rgb(C_BORDER)))
+            .child(Label::new("РАЗВЁРТКА").text_color(rgb(C_MUTED)))
+            .child(
+                h_flex()
+                    .w_full()
+                    .gap_1()
+                    .items_center()
+                    .child(Label::new("Время").text_color(rgb(C_MUTED)))
+                    .child(div().flex_1())
+                    .child(
+                        Button::new("td-minus")
+                            .label("−")
+                            .compact()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.step_time_div(-1);
+                                cx.notify();
+                            })),
+                    )
+                    .child(Label::new(t_str).text_color(rgb(C_TEXT)))
+                    .child(
+                        Button::new("td-plus")
+                            .label("+")
+                            .compact()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.step_time_div(1);
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .w_full()
+                    .gap_1()
+                    .items_center()
+                    .child(Label::new("Вольт").text_color(rgb(C_MUTED)))
+                    .child(div().flex_1())
+                    .child(
+                        Button::new("vd-minus")
+                            .label("−")
+                            .compact()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.step_v_div(-1);
+                                cx.notify();
+                            })),
+                    )
+                    .child(Label::new(v_str).text_color(rgb(C_TEXT)))
+                    .child(
+                        Button::new("vd-plus")
+                            .label("+")
+                            .compact()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.step_v_div(1);
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(
+                Button::new("trigger-toggle")
+                    .label(if self.trigger_on { "Триггер: вкл" } else { "Триггер: выкл" })
+                    .compact()
+                    .selected(self.trigger_on)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.trigger_on = !this.trigger_on;
+                        cx.notify();
+                    })),
+            )
             .into_any_element()
     }
 
@@ -527,20 +885,29 @@ impl LabApp {
     }
 
     fn render_gen_bar(&self, cx: &mut Context<Self>) -> AnyElement {
-        let shapes = [("Выкл", 0u8), ("Синус", 1u8), ("Треугольник", 2u8), ("Меандр", 3u8)];
+        let on = self.gen_en;
+        let bg = if on { C_PANEL_HI } else { C_PANEL };
+        let shapes = [("○", "Выкл", 0u8), ("∿", "Синус", 1u8), ("△", "Треугольник", 2u8), ("⊓", "Меандр", 3u8)];
         let mut row = h_flex()
-            .p_2()
-            .gap_1()
+            .w_full()
+            .px_3()
+            .py_2()
+            .gap_2()
             .items_center()
-            .child(Label::new("Генератор:"));
-        for (name, shape) in shapes {
+            .bg(rgb(bg))
+            .border_t_1()
+            .border_color(rgb(C_BORDER))
+            .child(Label::new("ГЕНЕРАТОР").text_color(if self.gen_en { rgb(C_TEXT) } else { rgb(C_OFF) }))
+            .child(div().w(px(1.)).h(px(18.)).bg(rgb(C_BORDER)));
+        for (glyph, title, shape) in shapes {
             let selected = if shape == 0 {
                 !self.gen_en
             } else {
                 self.gen_en && self.gen_shape == shape
             };
-            let btn = Button::new(name)
-                .label(name)
+            let btn = Button::new(title)
+                .label(glyph)
+                .tooltip(title)
                 .compact()
                 .selected(selected)
                 .on_click(cx.listener(move |this, _, _, cx| {
@@ -551,31 +918,60 @@ impl LabApp {
                 }));
             row = row.child(btn);
         }
-        row.child(
-            Button::new("gen-amp")
-                .label(format!("Амплитуда: {}/8", self.gen_amp))
-                .compact()
-                .on_click(cx.listener(|this, _, _, cx| {
-                    this.gen_amp = if this.gen_amp >= 8 { 1 } else { this.gen_amp + 1 };
-                    this.send_gen();
-                    cx.notify();
-                })),
-        )
-        .into_any_element()
+        row = row.child(div().w(px(12.)));
+        row = row.child(Label::new("АМПЛИТУДА").text_color(if self.gen_en { rgb(C_MUTED) } else { rgb(C_OFF) }));
+        for amp in 1u8..=8 {
+            let selected = self.gen_en && self.gen_amp == amp;
+            row = row.child(
+                Button::new(format!("gen-amp-{amp}"))
+                    .label(format!("{amp}"))
+                    .compact()
+                    .selected(selected)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.gen_amp = amp;
+                        this.send_gen();
+                        cx.notify();
+                    })),
+            );
+        }
+        row.into_any_element()
     }
 }
 
+static RENDER_COUNT: AtomicU64 = AtomicU64::new(0);
+
 impl Render for LabApp {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        let tab_bar = self.render_tab_bar(cx);
-        let gen_bar = self.render_gen_bar(cx);
+        let n = RENDER_COUNT.fetch_add(1, Ordering::Relaxed);
+        if n < 3 || n % 300 == 0 {
+            eprintln!(
+                "[labbench] render #{n} tab={:?} frame_count={}",
+                self.tab, self.frame_count
+            );
+        }
+        let toolbar = self.render_toolbar(cx);
+        let panel = self.render_channel_panel(cx);
         let content: AnyElement = match self.tab {
             Tab::Scope => self.render_scope(cx),
             Tab::Spectrum => self.render_spectrum(cx),
             Tab::Lcr => self.render_lcr(cx),
             Tab::Transient => self.render_transient(cx),
         };
-        v_flex().size_full().child(tab_bar).child(gen_bar).child(content)
+        let genbar = self.render_gen_bar(cx);
+        // Строгий приборный layout: тулбар · (панель каналов | контент) · генератор.
+        v_flex()
+            .size_full()
+            .bg(rgb(C_BG))
+            .child(toolbar)
+            .child(
+                h_flex()
+                    .flex_1()
+                    .w_full()
+                    .items_stretch()
+                    .child(panel)
+                    .child(div().flex_1().h_full().p_3().child(content)),
+            )
+            .child(genbar)
     }
 }
 
@@ -590,13 +986,41 @@ fn noise(k: usize) -> f32 {
 
 fn main() {
     let cli = Cli::parse();
+    eprintln!(
+        "[labbench] start: port={:?} baud={} simulate={} DISPLAY={:?}",
+        cli.port,
+        cli.baud,
+        cli.simulate,
+        std::env::var("DISPLAY").ok()
+    );
 
     gpui_kit::application().run(move |cx| {
+        eprintln!("[labbench] app init…");
         gpui_kit::init(cx);
-        gpui_kit::open_window(WindowOptions::default(), cx, |_window, cx| {
+        gpui_kit::component::Theme::change(gpui_kit::component::ThemeMode::Dark, None, cx);
+        eprintln!("[labbench] opening window…");
+        // На X11-бэкенде вариант Maximized лишь поставляет restore-size
+        // (`window_bounds.get_bounds()`), поэтому передаём реальные границы
+        // основного дисплея — окно открывается «во весь экран».
+        let max_bounds = Bounds::maximized(None, cx);
+        eprintln!("[labbench] display bounds: {max_bounds:?}");
+        let options = WindowOptions {
+            window_bounds: Some(WindowBounds::Maximized(max_bounds)),
+            titlebar: Some(TitlebarOptions {
+                title: Some("STM32F3Discovery oscilloscope v 0.2.4".into()),
+                ..Default::default()
+            }),
+            ..Default::default()
+        };
+        match gpui_kit::open_window(options, cx, |window, cx| {
+            // X11-бэкенд игнорирует вариант Maximized в WindowOptions, поэтому
+            // просим WM развернуть окно явно (после создания).
+            window.zoom_window();
             cx.new(|cx| LabApp::new(cli.port.clone(), cli.baud, cli.simulate, cx))
-        })
-        .expect("failed to open window");
+        }) {
+            Ok((handle, _view)) => eprintln!("[labbench] window opened: {handle:?}"),
+            Err(e) => eprintln!("[labbench] open_window FAILED: {e:?}"),
+        }
     });
 }
 

@@ -2,7 +2,7 @@
 set -e
 
 echo "Building firmware..."
-cargo build --release
+cargo +nightly build --release
 
 # target — thumbv7em-none-eabi (soft-float; FPU у STM32F303 есть, но в прошивке не используется)
 ELF="target/thumbv7em-none-eabi/release/ocd-stm32f3"

@@ -196,7 +196,17 @@ fn reader_loop(
                 buf.extend_from_slice(&chunk[..n]);
                 drain(&mut buf, &ev_tx);
             }
-            Err(_) => {
+            Err(e) => {
+                // Read timeouts / would-block are "no data yet", NOT a lost device.
+                // Dropping the port here churns the TTY and (on flaky CDC) wedges it.
+                let soft = matches!(
+                    e.kind(),
+                    std::io::ErrorKind::TimedOut | std::io::ErrorKind::WouldBlock
+                );
+                if soft {
+                    thread::sleep(Duration::from_millis(5));
+                    continue;
+                }
                 port = None;
                 let _ = ev_tx.try_send(Event::Status("порт закрылся, переподключение…".into()));
             }

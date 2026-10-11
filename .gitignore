@@ -4,6 +4,8 @@
 Cargo-.lock.bak
 .gpui-cache/
 tmp/
+*/examples/
+AGENTS.*
 
 # временные артефакты переноса истории
 /*.bundle

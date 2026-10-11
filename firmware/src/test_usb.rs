@@ -17,6 +17,18 @@ bind_interrupts!(struct Irqs {
     USB_LP_CAN_RX0 => usb::InterruptHandler<peripherals::USB>;
 });
 
+// Принудительный разрыв D+: ведём PA12 как выход и держим в 0 ~250 мс, затем
+// отпускаем (входной режим → линию снова поднимает внешняя подтяжка). Нужно
+// потому, что у usb_v1 (F303) нет программного DPPU/soft-disconnect.
+fn force_usb_disconnect() {
+    use embassy_stm32::pac::{gpio::vals::Moder, GPIOA};
+    GPIOA.moder().modify(|w| w.set_moder(12, Moder::OUTPUT));
+    GPIOA.bsrr().write(|w| w.set_br(12, true));
+    cortex_m::asm::delay(72_000_000 / 1000 * 250);
+    GPIOA.moder().modify(|w| w.set_moder(12, Moder::INPUT));
+    cortex_m::asm::delay(72_000_000 / 1000 * 50);
+}
+
 #[embassy_executor::main]
 async fn main(_spawner: Spawner) {
     let mut config = Config::default();
@@ -39,6 +51,13 @@ async fn main(_spawner: Spawner) {
     let p = embassy_stm32::init(config);
     info!("USB CDC-ACM test v0.1");
 
+    // STM32F303 (usb_v1) не имеет BCDR/DPPU: подтяжка D+ внешняя и всегда
+    // активна, поэтому сброс МКУ не даёт разрыва линии, и хост не
+    // пере-энумерирует устройство. Принудительно тянем D+ (PA12) в 0, чтобы
+    // хост увидел disconnect, затем отпускаем (внешняя подтяжка поднимет линию)
+    // — получаем чистое свежее подключение.
+    force_usb_disconnect();
+
     let driver = Driver::new(p.USB, Irqs, p.PA12, p.PA11);
     let mut usb_config = embassy_usb::Config::new(0xc0de, 0xcafe);
     usb_config.manufacturer = Some("Embassy");
@@ -47,7 +66,7 @@ async fn main(_spawner: Spawner) {
 
     let mut config_descriptor = [0; 256];
     let mut bos_descriptor = [0; 256];
-    let mut control_buf = [0; 7];
+    let mut control_buf = [0; 128];
     let mut state = CdcState::new();
 
     let mut builder = Builder::new(
