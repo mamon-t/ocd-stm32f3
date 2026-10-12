@@ -29,24 +29,20 @@ pub const ACK_MASK: u8 = 0xB3;
 pub const ACK_FS: u8 = 0xA4;
 
 pub const NUM_CHANNELS: usize = 10;
-pub const MAX_FRAME_LEN: usize = 5 + NUM_CHANNELS * 2; // 25
 
 /// Нормализованный канал для графических приборов: [-1.0 .. 1.0].
+/// Публичная утилита протокола; в бинарнике нормировка выполняется
+/// потоково в `LabApp::push_frame`, поэтому здесь только кодек/тесты.
+#[allow(dead_code)]
 #[inline]
 pub fn normalize(raw: &[u16]) -> Vec<f32> {
     raw.iter().map(|&v| v as f32 / 2047.5 - 1.0).collect()
 }
 
-/// То же, но «в вольты» (Vref = 3.3 В, 12 бит).
-#[inline]
-pub fn to_volts(raw: &[u16]) -> Vec<f32> {
-    raw.iter().map(|&v| v as f32 * (3.3 / 4095.0)).collect()
-}
-
 #[derive(Debug, Clone)]
 pub enum Ack {
     Rate(u8),
-    Channel { ch: u8, enabled: bool, sample_time: u8 },
+    Channel { ch: u8, enabled: bool, #[allow(dead_code)] sample_time: u8 },
     Mask { lo: u8, hi: u8 },
     /// Измеренная прошивкой частота сканирования (Гц) — это и есть f_s сигнала канала.
     SampleRate(u32),
@@ -118,6 +114,9 @@ pub fn get_mask(&self) {
         self.rx.len()
     }
 
+    /// Остановить reader и дождаться завершения потока. Зарезервировано под
+    /// аккуратное завершение (в GUI не вызывается — поток живёт до выхода).
+    #[allow(dead_code)]
     pub fn shutdown(&mut self) {
         self.stop.store(true, Ordering::Relaxed);
         if let Some(h) = self.handle.take() {

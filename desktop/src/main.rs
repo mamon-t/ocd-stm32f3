@@ -37,7 +37,7 @@ const C_TEXT: u32 = 0xe6e9ee; // контрастный текст
 const C_MUTED: u32 = 0x99a3ae; // приглушённый текст
 const C_ACCENT: u32 = 0x4d9de0; // акцентный синий
 const C_OFF: u32 = 0x555d68; // «выключено» (серый)
-const C_TRIG: u32 = 0xe0a24d; // цвет метки триггера
+const C_SEL: u32 = 0x34465c; // фон выбранного канала
 
 /// Шаг сетки развёртки (мс/дел), от 10 мкс до 5 мс.
 const TIME_DIVS: [f32; 9] = [0.01, 0.02, 0.05, 0.1, 0.2, 0.5, 1.0, 2.0, 5.0];
@@ -109,6 +109,24 @@ pub struct LabApp {
     gen_shape: u8, // 1=синус, 2=треугольник, 3=меандр
     gen_amp: u8,   // 1..8, уровень амплитуды
 
+    // --- измерения / курсоры / спектр / смещение ---
+    /// Активный канал для таблицы измерений, авто-развёртки и смещения.
+    selected_ch: usize,
+    cursors_on: bool,
+    /// Курсоры A/B как доли ширины окна [0..1].
+    cursor_a: f32,
+    cursor_b: f32,
+    spec_window: dsp::WindowKind,
+    /// Экспоненциальное усреднение спектра (снижает шум).
+    spec_avg: bool,
+    spec_avg_dbs: Vec<f32>,
+    /// Найденный пик спектра: (частота Гц, уровень дБ).
+    spec_peak: Option<(f32, f32)>,
+    /// Фиксированная шкала спектра −120..0 дБ (иначе — авто).
+    spec_fixed_db: bool,
+    /// Вертикальное смещение канала, вольт.
+    ch_offset_v: [f32; 10],
+
     status_line: String,
 }
 
@@ -152,6 +170,16 @@ impl LabApp {
             gen_en: false,
             gen_shape: 1,
             gen_amp: 4,
+            selected_ch: 0,
+            cursors_on: false,
+            cursor_a: 0.35,
+            cursor_b: 0.65,
+            spec_window: dsp::WindowKind::Hann,
+            spec_avg: false,
+            spec_avg_dbs: Vec::new(),
+            spec_peak: None,
+            spec_fixed_db: false,
+            ch_offset_v: [0.0; 10],
             status_line: "ожидание данных…".to_string(),
         };
         app.start_pump(cx);
@@ -324,13 +352,29 @@ impl LabApp {
         if fs <= 0.0 {
             return;
         }
-        let y0 = self.channel_slice(0);
+        let y0 = self.channel_slice(self.selected_ch.min(9));
         if y0.len() >= 256 {
             let n = y0.len().next_power_of_two().min(y0.len());
-            let win = dsp::hann(n);
+            let win = self.spec_window.coeffs(n);
             let (fr, db) = dsp::amplitude_db(&y0[..n], fs, &win);
+            self.spec_peak = dsp::spectral_peak(&fr, &db);
+            // Экспоненциальное усреднение по бинам (снижение шумовой дорожки).
+            let out_db: Vec<f32> = if self.spec_avg {
+                const ALPHA: f32 = 0.25;
+                if self.spec_avg_dbs.len() != db.len() {
+                    self.spec_avg_dbs = db.clone();
+                } else {
+                    for (acc, &d) in self.spec_avg_dbs.iter_mut().zip(db.iter()) {
+                        *acc += ALPHA * (d - *acc);
+                    }
+                }
+                self.spec_avg_dbs.clone()
+            } else {
+                self.spec_avg_dbs.clear();
+                db
+            };
             self.spec_freqs = Rc::new(fr);
-            self.spec_dbs = Rc::new(db);
+            self.spec_dbs = Rc::new(out_db);
         }
 
         let y1 = self.channel_slice(1);
@@ -399,8 +443,83 @@ impl LabApp {
         self.v_per_div = V_DIVS[ni];
     }
 
+    /// Шаг частоты выборки устройства (0..7 — время выборки АЦП, команда 0xA0).
+    fn step_rate(&mut self, dir: i32) {
+        let ni = (self.rate_level as i32 + dir).clamp(0, 7) as u8;
+        self.rate_level = ni;
+        if let Some(t) = &self.transport {
+            t.set_rate(ni);
+        }
+    }
+
+    /// Смещение трассы активного канала на ±0.5 В.
+    fn step_offset(&mut self, dir: i32) {
+        let v = self.ch_offset_v[self.selected_ch] + dir as f32 * 0.5;
+        self.ch_offset_v[self.selected_ch] = v.clamp(-5.0, 5.0);
+    }
+
+    /// Авто-развёртка: подбор мс/дел и В/дел под сигнал активного канала.
+    fn auto_set(&mut self) {
+        let y = self.displayed_slice(self.selected_ch);
+        if let Some(m) = dsp::measure_channel(&y, self.fs_hz.max(1.0), UNIT_V) {
+            if m.freq_hz > 1.0 {
+                // ~3 периода на 10 делений.
+                let td = (3.0 / m.freq_hz * 1000.0) / 10.0;
+                self.time_div_ms = TIME_DIVS[nearest_idx(&TIME_DIVS, td)];
+            }
+            if m.vpp > 1e-3 {
+                self.v_per_div = V_DIVS[nearest_idx(&V_DIVS, m.vpp / 6.0)];
+            }
+        }
+    }
+
+    /// Последние `win` отсчётов канала — то же окно, что рисуется на экране.
+    fn displayed_slice(&self, ch: usize) -> Vec<f32> {
+        let fs = self.fs_hz.max(1.0);
+        let win = (((self.time_div_ms * 10.0) * fs / 1000.0).round() as usize).clamp(16, RING_LEN);
+        let raw = self.channel_slice(ch.min(9));
+        if raw.len() > win {
+            raw[raw.len() - win..].to_vec()
+        } else {
+            raw.to_vec()
+        }
+    }
+
+    /// Измерения активного канала за текущее окно.
+    fn selected_metrics(&self) -> Option<dsp::ChanMetrics> {
+        dsp::measure_channel(&self.displayed_slice(self.selected_ch), self.fs_hz.max(1.0), UNIT_V)
+    }
+
+    /// ΔT / 1/ΔT / ΔV между курсорами (по активному каналу).
+    fn cursor_readout(&self) -> Option<(f32, f32, f32)> {
+        if !self.cursors_on {
+            return None;
+        }
+        let y = self.displayed_slice(self.selected_ch);
+        if y.len() < 2 {
+            return None;
+        }
+        let ia = (self.cursor_a.clamp(0.0, 1.0) * (y.len() - 1) as f32).round() as usize;
+        let ib = (self.cursor_b.clamp(0.0, 1.0) * (y.len() - 1) as f32).round() as usize;
+        let dv = (y[ib] - y[ia]) * UNIT_V;
+        let dt_ms = (self.cursor_b - self.cursor_a).abs() * self.time_div_ms * 10.0;
+        let f_hz = if dt_ms > 1e-9 { 1000.0 / dt_ms } else { 0.0 };
+        Some((dt_ms, f_hz, dv))
+    }
+
     fn render_scope(&self, _cx: &Context<Self>) -> AnyElement {
         let chans = self.visible_channels();
+        let ids: Vec<usize> = (0..10).filter(|&c| self.ch_enabled[c]).collect();
+        let offsets: Vec<f32> = if ids.is_empty() {
+            vec![self.ch_offset_v[0]]
+        } else {
+            ids.iter().map(|&c| self.ch_offset_v[c]).collect()
+        };
+        let highlight = if ids.is_empty() {
+            Some(0)
+        } else {
+            ids.iter().position(|&c| c == self.selected_ch)
+        };
 
         let mut header = h_flex()
             .w_full()
@@ -411,8 +530,28 @@ impl LabApp {
                 Label::new(if self.trigger_on { "триггер: вкл" } else { "триггер: выкл" })
                     .text_color(rgb(C_MUTED)),
             )
-            .child(div().flex_1())
-            .child(Label::new(format!("каналов: {}", chans.len())).text_color(rgb(C_MUTED)));
+            .child(
+                Label::new(format!("канал CH{}", self.selected_ch)).text_color(rgb(C_MUTED)),
+            );
+        if let Some((dt, f, dv)) = self.cursor_readout() {
+            let dt_s = if dt < 1.0 {
+                format!("{:.0} мкс", dt * 1000.0)
+            } else {
+                format!("{dt:.2} мс")
+            };
+            let f_s = if f >= 1000.0 {
+                format!("{:.2} кГц", f / 1000.0)
+            } else {
+                format!("{f:.0} Гц")
+            };
+            header = header
+                .child(Label::new(format!("ΔT {dt_s}")).text_color(rgb(C_ACCENT)))
+                .child(Label::new(format!("1/ΔT {f_s}")).text_color(rgb(C_ACCENT)))
+                .child(Label::new(format!("ΔV {dv:+.2} В")).text_color(rgb(C_ACCENT)));
+        }
+        header = header.child(div().flex_1()).child(
+            Label::new(format!("каналов: {}", chans.len())).text_color(rgb(C_MUTED)),
+        );
         if self.lost_frames > 0 {
             header = header.child(
                 Label::new(format!("потеряно {}", self.lost_frames)).text_color(rgb(C_ACCENT)),
@@ -442,14 +581,21 @@ impl LabApp {
                                         None
                                     })
                                     .v_per_div(self.v_per_div)
-                                    .time_per_div_ms(self.time_div_ms),
+                                    .time_per_div_ms(self.time_div_ms)
+                                    .offsets(offsets)
+                                    .highlight(highlight)
+                                    .cursors(if self.cursors_on {
+                                        Some((self.cursor_a, self.cursor_b))
+                                    } else {
+                                        None
+                                    }),
                             ),
                     ),
             )
             .into_any_element()
     }
 
-    fn render_spectrum(&self, _cx: &Context<Self>) -> AnyElement {
+    fn render_spectrum(&self, cx: &mut Context<Self>) -> AnyElement {
         let points: Vec<(f32, f32)> = self
             .spec_freqs
             .iter()
@@ -465,6 +611,76 @@ impl LabApp {
         });
         let y_fmt: Rc<dyn Fn(f32) -> String> = Rc::new(|db: f32| format!("{db:.0}"));
 
+        let mut wrow = h_flex()
+            .gap_1()
+            .items_center()
+            .child(Label::new("ОКНО").text_color(rgb(C_MUTED)));
+        for w in [
+            dsp::WindowKind::Hann,
+            dsp::WindowKind::Hamming,
+            dsp::WindowKind::Blackman,
+            dsp::WindowKind::Rect,
+        ] {
+            wrow = wrow.child(
+                Button::new(format!("spec-win-{w:?}"))
+                    .label(w.name())
+                    .tooltip(w.name())
+                    .compact()
+                    .selected(self.spec_window == w)
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.spec_window = w;
+                        this.spec_avg_dbs.clear();
+                        cx.notify();
+                    })),
+            );
+        }
+
+        let mut header = h_flex()
+            .w_full()
+            .gap_3()
+            .items_center()
+            .child(Label::new("СПЕКТР").text_color(rgb(C_TEXT)))
+            .child(div().w(px(1.)).h(px(18.)).bg(rgb(C_BORDER)))
+            .child(wrow)
+            .child(
+                Button::new("spec-avg")
+                    .label("усредн.")
+                    .tooltip("Экспоненциальное усреднение спектра")
+                    .compact()
+                    .selected(self.spec_avg)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.spec_avg = !this.spec_avg;
+                        this.spec_avg_dbs.clear();
+                        cx.notify();
+                    })),
+            )
+            .child(
+                Button::new("spec-scale")
+                    .label(if self.spec_fixed_db { "дБ: −120…0" } else { "дБ: авто" })
+                    .compact()
+                    .selected(self.spec_fixed_db)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.spec_fixed_db = !this.spec_fixed_db;
+                        cx.notify();
+                    })),
+            )
+            .child(div().flex_1());
+        if let Some((f, db)) = self.spec_peak {
+            header = header.child(
+                Label::new(format!("пик {:.0} Гц / {db:.1} дБ", f)).text_color(rgb(C_ACCENT)),
+            );
+        }
+        header = header
+            .child(Label::new(format!("fs = {:.0} Гц", self.fs_hz)).text_color(rgb(C_MUTED)));
+
+        let mut plot = PlotCanvas::new(points, x_fmt, y_fmt).line_color(rgb(C_ACCENT).into());
+        if self.spec_fixed_db {
+            plot = plot.y_range(-120.0, 0.0);
+        }
+        if let Some((f, _)) = self.spec_peak {
+            plot = plot.marker_x(f);
+        }
+
         h_flex()
             .size_full()
             .items_stretch()
@@ -473,28 +689,14 @@ impl LabApp {
                     .flex_1()
                     .h_full()
                     .gap_2()
-                    .child(
-                        h_flex()
-                            .w_full()
-                            .gap_4()
-                            .items_center()
-                            .child(Label::new("СПЕКТР").text_color(rgb(C_TEXT)))
-                            .child(div().flex_1())
-                            .child(
-                                Label::new(format!("fs = {:.0} Гц", self.fs_hz))
-                                    .text_color(rgb(C_MUTED)),
-                            ),
-                    )
+                    .child(header)
                     .child(
                         div()
                             .id("spectrum-canvas")
                             .flex_1()
                             .w_full()
                             .overflow_hidden()
-                            .child(
-                                PlotCanvas::new(points, x_fmt, y_fmt)
-                                    .line_color(rgb(C_ACCENT).into()),
-                            ),
+                            .child(plot),
                     ),
             )
             .into_any_element()
@@ -521,8 +723,25 @@ impl LabApp {
                     h_flex()
                         .gap_3()
                         .items_center()
-                        .child(Label::new("|Z|:").text_color(rgb(C_MUTED)))
+                        .child(Label::new("Значение:").text_color(rgb(C_MUTED)))
                         .child(Label::new(format!("{val:.2} {unit}")).text_color(rgb(C_TEXT))),
+                )
+                .child(
+                    h_flex()
+                        .gap_3()
+                        .items_center()
+                        .child(Label::new("|Z|:").text_color(rgb(C_MUTED)))
+                        .child(Label::new(format!("{:.1} Ом", z.mag())).text_color(rgb(C_TEXT))),
+                )
+                .child(
+                    h_flex()
+                        .gap_3()
+                        .items_center()
+                        .child(Label::new("Фаза:").text_color(rgb(C_MUTED)))
+                        .child(
+                            Label::new(format!("{:+.1}° (R + jX)", z.phase_deg()))
+                                .text_color(rgb(C_TEXT)),
+                        ),
                 )
                 .child(
                     h_flex()
@@ -761,7 +980,13 @@ impl LabApp {
                 .gap_2()
                 .items_center()
                 .rounded(px(3.))
-                .bg(if enabled { rgb(C_PANEL_HI) } else { rgb(C_PANEL) })
+                .bg(if ch == self.selected_ch {
+                    rgb(C_SEL)
+                } else if enabled {
+                    rgb(C_PANEL_HI)
+                } else {
+                    rgb(C_PANEL)
+                })
                 .child(
                     div()
                         .id(format!("ch-mark-{ch}"))
@@ -772,8 +997,16 @@ impl LabApp {
                         .on_click(cx.listener(move |this, _, _, cx| this.toggle_channel(ch, cx))),
                 )
                 .child(
-                    Label::new(format!("CH{ch}"))
-                        .text_color(if enabled { rgb(C_TEXT) } else { rgb(C_MUTED) }),
+                    div()
+                        .id(format!("ch-sel-{ch}"))
+                        .on_click(cx.listener(move |this, _, _, cx| {
+                            this.selected_ch = ch;
+                            cx.notify();
+                        }))
+                        .child(
+                            Label::new(format!("CH{ch}"))
+                                .text_color(if enabled { rgb(C_TEXT) } else { rgb(C_MUTED) }),
+                        ),
                 )
                 .child(div().flex_1())
                 .child(Label::new(format!("{vpp:.2}В")).text_color(rgb(C_MUTED)))
@@ -868,6 +1101,189 @@ impl LabApp {
                         cx.notify();
                     })),
             )
+            .child(
+                Button::new("auto-set")
+                    .label("АВТО")
+                    .tooltip("Подстроить развёртку под сигнал")
+                    .compact()
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.auto_set();
+                        cx.notify();
+                    })),
+            )
+            .child(div().h(px(10.)))
+            .child(div().w_full().h(px(1.)).bg(rgb(C_BORDER)))
+            .child(Label::new("СИНХРОНИЗАЦИЯ").text_color(rgb(C_MUTED)))
+            .child(
+                h_flex()
+                    .w_full()
+                    .gap_1()
+                    .items_center()
+                    .child(Label::new("Част. выб.").text_color(rgb(C_MUTED)))
+                    .child(div().flex_1())
+                    .child(
+                        Button::new("rate-minus")
+                            .label("−")
+                            .compact()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.step_rate(-1);
+                                cx.notify();
+                            })),
+                    )
+                    .child(Label::new(format!("ур. {}", self.rate_level)).text_color(rgb(C_TEXT)))
+                    .child(
+                        Button::new("rate-plus")
+                            .label("+")
+                            .compact()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.step_rate(1);
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .w_full()
+                    .gap_1()
+                    .items_center()
+                    .child(Label::new(format!("Смещ. CH{}", self.selected_ch)).text_color(rgb(C_MUTED)))
+                    .child(div().flex_1())
+                    .child(
+                        Button::new("off-minus")
+                            .label("−")
+                            .compact()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.step_offset(-1);
+                                cx.notify();
+                            })),
+                    )
+                    .child(Label::new(format!("{:+.1} В", self.ch_offset_v[self.selected_ch])).text_color(rgb(C_TEXT)))
+                    .child(
+                        Button::new("off-plus")
+                            .label("+")
+                            .compact()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.step_offset(1);
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(div().h(px(10.)))
+            .child(div().w_full().h(px(1.)).bg(rgb(C_BORDER)))
+            .child(Label::new("КУРСОРЫ").text_color(rgb(C_MUTED)))
+            .child(
+                Button::new("cursors-toggle")
+                    .label(if self.cursors_on { "Курсоры: вкл" } else { "Курсоры: выкл" })
+                    .compact()
+                    .selected(self.cursors_on)
+                    .on_click(cx.listener(|this, _, _, cx| {
+                        this.cursors_on = !this.cursors_on;
+                        cx.notify();
+                    })),
+            )
+            .child(
+                h_flex()
+                    .w_full()
+                    .gap_1()
+                    .items_center()
+                    .child(Label::new("A").text_color(rgb(C_TEXT)))
+                    .child(div().flex_1())
+                    .child(
+                        Button::new("ca-minus")
+                            .label("−")
+                            .compact()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.cursor_a = (this.cursor_a - 0.02).clamp(0.0, 1.0);
+                                cx.notify();
+                            })),
+                    )
+                    .child(Label::new(format!("{:.0}%", self.cursor_a * 100.0)).text_color(rgb(C_TEXT)))
+                    .child(
+                        Button::new("ca-plus")
+                            .label("+")
+                            .compact()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.cursor_a = (this.cursor_a + 0.02).clamp(0.0, 1.0);
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child(
+                h_flex()
+                    .w_full()
+                    .gap_1()
+                    .items_center()
+                    .child(Label::new("B").text_color(rgb(C_TEXT)))
+                    .child(div().flex_1())
+                    .child(
+                        Button::new("cb-minus")
+                            .label("−")
+                            .compact()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.cursor_b = (this.cursor_b - 0.02).clamp(0.0, 1.0);
+                                cx.notify();
+                            })),
+                    )
+                    .child(Label::new(format!("{:.0}%", self.cursor_b * 100.0)).text_color(rgb(C_TEXT)))
+                    .child(
+                        Button::new("cb-plus")
+                            .label("+")
+                            .compact()
+                            .on_click(cx.listener(|this, _, _, cx| {
+                                this.cursor_b = (this.cursor_b + 0.02).clamp(0.0, 1.0);
+                                cx.notify();
+                            })),
+                    ),
+            )
+            .child({
+                let readout = match self.cursor_readout() {
+                    Some((dt, f, dv)) => format!("ΔT {dt:.2}мс  {f:.0}Гц  ΔV {dv:.2}В"),
+                    None => "курсоры выкл.".to_string(),
+                };
+                Label::new(readout).text_color(rgb(C_ACCENT))
+            })
+            .child(div().h(px(10.)))
+            .child(div().w_full().h(px(1.)).bg(rgb(C_BORDER)))
+            .child(Label::new(format!("ИЗМЕРЕНИЯ CH{}", self.selected_ch)).text_color(rgb(C_MUTED)))
+            .child({
+                let rows: Vec<(String, String)> = match self.selected_metrics() {
+                    Some(m) => {
+                        let f = if m.freq_hz >= 1000.0 {
+                            format!("{:.2} кГц", m.freq_hz / 1000.0)
+                        } else {
+                            format!("{:.1} Гц", m.freq_hz)
+                        };
+                        let per = if m.period_s < 1e-3 {
+                            format!("{:.0} мкс", m.period_s * 1e6)
+                        } else {
+                            format!("{:.2} мс", m.period_s * 1e3)
+                        };
+                        vec![
+                            ("Vpp".to_string(), format!("{:.3} В", m.vpp)),
+                            ("Vrms".to_string(), format!("{:.3} В", m.vrms)),
+                            ("Vср".to_string(), format!("{:.3} В", m.vavg)),
+                            ("Vмакс".to_string(), format!("{:.3} В", m.vmax)),
+                            ("Vмин".to_string(), format!("{:.3} В", m.vmin)),
+                            ("Частота".to_string(), f),
+                            ("Период".to_string(), per),
+                            ("Скважн.".to_string(), format!("{:.0} %", m.duty * 100.0)),
+                        ]
+                    }
+                    None => vec![("—".to_string(), "нет данных".to_string())],
+                };
+                let mut tbl = v_flex().w_full().gap_1();
+                for (name, val) in rows {
+                    tbl = tbl.child(
+                        h_flex()
+                            .w_full()
+                            .items_center()
+                            .child(Label::new(name).text_color(rgb(C_MUTED)))
+                            .child(div().flex_1())
+                            .child(Label::new(val).text_color(rgb(C_TEXT))),
+                    );
+                }
+                tbl
+            })
             .into_any_element()
     }
 

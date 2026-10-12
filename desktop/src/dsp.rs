@@ -61,6 +61,65 @@ pub fn hann(n: usize) -> Vec<f32> {
         .collect()
 }
 
+/// Коэффициенты окна Хэмминга (шире главный лепесток, ниже боковые — хорошо
+/// для точного измерения амплитуды тона).
+pub fn hamming(n: usize) -> Vec<f32> {
+    (0..n)
+        .map(|i| {
+            let x = std::f64::consts::TAU * i as f64 / (n - 1).max(1) as f64;
+            (0.54 - 0.46 * x.cos()) as f32
+        })
+        .collect()
+}
+
+/// Коэффициенты окна Блэкмана (максимальное подавление боковых лепестков,
+/// ценой ширины главного — для поиска слабых гармоник).
+pub fn blackman(n: usize) -> Vec<f32> {
+    (0..n)
+        .map(|i| {
+            let x = std::f64::consts::TAU * i as f64 / (n - 1).max(1) as f64;
+            (0.42 - 0.5 * x.cos() + 0.08 * (2.0 * x).cos()) as f32
+        })
+        .collect()
+}
+
+/// Прямоугольное окно (без оконной функции) — наилучшее разрешение по частоте,
+/// но максимальные утечки.
+pub fn rectwin(n: usize) -> Vec<f32> {
+    vec![1.0; n]
+}
+
+/// Именованное окно спектра для UI и тестов.
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+pub enum WindowKind {
+    Hann,
+    Hamming,
+    Blackman,
+    Rect,
+}
+
+impl WindowKind {
+    /// Коэффициенты окна длиной `n`.
+    pub fn coeffs(self, n: usize) -> Vec<f32> {
+        match self {
+            WindowKind::Hann => hann(n),
+            WindowKind::Hamming => hamming(n),
+            WindowKind::Blackman => blackman(n),
+            WindowKind::Rect => rectwin(n),
+        }
+    }
+
+    /// Короткое имя для UI.
+    pub fn name(self) -> &'static str {
+        match self {
+            WindowKind::Hann => "Ханна",
+            WindowKind::Hamming => "Хэмминга",
+            WindowKind::Blackman => "Блэкмана",
+            WindowKind::Rect => "прямоуг.",
+        }
+    }
+}
+
 /// Односторонний амплитудный спектр в дБFS.
 /// Возвращает (частоты_Гц, уровень_дБ) длиной N/2+1.
 pub fn amplitude_db(y: &[f32], fs: f32, window: &[f32]) -> (Vec<f32>, Vec<f32>) {
@@ -104,6 +163,87 @@ pub fn spectral_peak(freqs: &[f32], dbs: &[f32]) -> Option<(f32, f32)> {
     } else {
         None
     }
+}
+
+// ============================================================================
+// Измерения одного канала (таблица измерений осциллографа)
+// ============================================================================
+
+/// Базовые измерения канала за окно наблюдения; значения — в вольтах.
+#[derive(Clone, Copy, Debug, Default)]
+pub struct ChanMetrics {
+    pub vpp: f32,
+    pub vmax: f32,
+    pub vmin: f32,
+    pub vrms: f32,
+    pub vavg: f32,
+    pub freq_hz: f32,
+    pub period_s: f32,
+    /// Доля времени, когда сигнал выше среднего (скважность).
+    pub duty: f32,
+}
+
+/// Основные измерения по выборке канала: `y` — нормированные отсчёты [-1..1],
+/// `unit_v` — вольт на единицу нормировки, `fs` — частота дискретизации (Гц).
+///
+/// Частота оценивается по числу переходов через средний уровень (устойчиво
+/// для периодических сигналов произвольной формы). `None`, если данных мало.
+pub fn measure_channel(y: &[f32], fs: f32, unit_v: f32) -> Option<ChanMetrics> {
+    let n = y.len();
+    if n < 8 || fs <= 0.0 {
+        return None;
+    }
+    let (mut lo, mut hi, mut sum) = (f32::INFINITY, f32::NEG_INFINITY, 0.0f64);
+    for &v in y {
+        if v < lo {
+            lo = v;
+        }
+        if v > hi {
+            hi = v;
+        }
+        sum += v as f64;
+    }
+    let mean = (sum / n as f64) as f32;
+    let sq: f64 = y.iter().map(|&v| (v as f64) * (v as f64)).sum();
+    let rms = (sq / n as f64).sqrt() as f32;
+
+    // Восходящие переходы через средний уровень → оценка периода.
+    let mut rises = 0u32;
+    let mut prev_above = y[0] > mean;
+    let mut first_rise: Option<usize> = None;
+    let mut last_rise: Option<usize> = None;
+    for (i, &v) in y.iter().enumerate() {
+        let above = v > mean;
+        if !prev_above && above {
+            rises += 1;
+            if first_rise.is_none() {
+                first_rise = Some(i);
+            }
+            last_rise = Some(i);
+        }
+        prev_above = above;
+    }
+    let (freq_hz, period_s, duty) = match (first_rise, last_rise) {
+        (Some(fr), Some(lr)) if rises >= 2 && lr > fr => {
+            let cycles = (rises - 1) as f32;
+            let period_samples = (lr - fr) as f32 / cycles;
+            let f = fs / period_samples;
+            let high = y.iter().filter(|&&v| v > mean).count();
+            (f, 1.0 / f.max(1e-9), high as f32 / n as f32)
+        }
+        _ => (0.0, 0.0, 0.0),
+    };
+
+    Some(ChanMetrics {
+        vpp: (hi - lo) * unit_v,
+        vmax: hi * unit_v,
+        vmin: lo * unit_v,
+        vrms: rms * unit_v,
+        vavg: mean * unit_v,
+        freq_hz,
+        period_s,
+        duty,
+    })
 }
 
 // ============================================================================
@@ -301,5 +441,26 @@ mod tests {
         let y: Vec<f32> = (0..8192).map(|i| 1.0 - (-i as f32 / (fs * tau)).exp()).collect();
         let tr = rise_time_10_90(&y, fs).unwrap();
         assert!((tr - 2.2e-3).abs() < 0.3e-3, "t_r = {tr:e}");
+    }
+
+    #[test]
+    fn measure_channel_finds_sine() {
+        let (fs, f0) = (100_000.0f32, 1_000.0f32);
+        let y = sine(4096, f0, fs, 0.8, 0.0);
+        let m = measure_channel(&y, fs, 1.65).unwrap();
+        let vpp_want = 2.0 * 0.8 * 1.65;
+        assert!((m.freq_hz - f0).abs() / f0 < 0.05, "f = {}", m.freq_hz);
+        assert!((m.vpp - vpp_want).abs() / vpp_want < 0.05, "vpp = {}", m.vpp);
+        assert!((m.duty - 0.5).abs() < 0.02, "duty = {}", m.duty);
+    }
+
+    #[test]
+    fn window_coeffs_are_shaped() {
+        assert_eq!(rectwin(8), vec![1.0f32; 8]);
+        for w in [hann(64), hamming(64), blackman(64)] {
+            assert_eq!(w.len(), 64);
+            assert!(w.iter().all(|&v| (-1e-4..=1.0).contains(&v)));
+            assert!(w[0] < 0.1 && w[63] < 0.1, "края окна должны быть заужены");
+        }
     }
 }

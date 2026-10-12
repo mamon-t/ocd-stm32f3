@@ -13,6 +13,7 @@
 //! incrementing `seq`.
 
 #[path = "../src/transport.rs"]
+#[allow(dead_code)] // harness exercises a subset of the protocol API
 mod transport;
 
 use std::time::{Duration, Instant};
@@ -30,7 +31,7 @@ fn live_protocol_round_trip() {
     let port = std::env::var("LIVE_PORT").ok().filter(|p| !p.is_empty());
     eprintln!("[harness] port = {:?}", port);
 
-    let mut t = Transport::spawn(port, BAUD);
+    let t = Transport::spawn(port, BAUD);
     let deadline = Instant::now() + GLOBAL_DEADLINE;
     let mut connected = false;
 

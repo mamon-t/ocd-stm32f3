@@ -69,8 +69,8 @@ Notes:
 - **PA0 also carries the USER button B1** (SB20 closed by default): the pin is
   pulled up (~3.3 V) and goes low while the button is held.
 - All inputs are sampled through ADC1 configured continuous + circular,
-  transferred to RAM by **DMA1_CH1** (512-sample ring buffer), overrun is
-  reported in-band.
+  transferred to RAM by **DMA1_CH1** (**2520**-sample ring buffer — LCM(1..10),
+  so any active channel set divides it evenly), overrun is reported in-band.
 - User LEDs (all driven high, LED to GND via ~510–680 Ω):
   - **LD4 (blue) = PE8** — heartbeat (blinks while the firmware is alive);
   - **LD5 (orange) = PE10** — USB CDC connected (host opened the port);
@@ -191,9 +191,22 @@ The firmware carries a small calibration generator on **DAC1_OUT1 = PA4**
 
 The signal is synthesised in software: **20 samples per period at a fixed
 20 kHz tick (≈1 kHz)**, 12-bit DAC, rail-to-rail on PA4. The desktop `labbench`
-exposes this as the *Generator* bar (shape buttons `Выкл/Синус/Треугольник/Меандр`
-and an amplitude cycle `1..8`), so a scope probe on PA4 gives a self-test signal
-without external hardware.
+exposes this as the *Generator* bar: shape pictograms (`○ ∿ △ ⊓`), an explicit
+amplitude switch `1..8`, and a greyed-out look while the generator is off — so a
+scope probe on PA4 gives a self-test signal without external hardware.
+
+The desktop window is organised as a top toolbar (mode indicator + tab
+pictograms for Scope `∿`, Spectrum `≡`, LCR `Ω`, Transient `↗`), a left channel
+panel, the plot area (grid with volt/time axis labels), and the generator bar at
+the bottom. The channel panel carries a colour marker, on/off and active-channel
+selection (click `CHn`; its trace is highlighted), live Vpp, a **measurements
+table** for the active channel (Vpp · Vrms · avg · max · min · frequency ·
+period · duty), time/div and volt/div steppers, an **AUTO** button (fit mс/div
+and V/div to the signal), the trigger toggle, an **ADC sample-rate selector**,
+a per-channel **vertical offset** and **A/B cursors** with ΔT · 1/ΔT · ΔV
+readout. The Spectrum tab adds a window selector (Hann · Hamming · Blackman ·
+rectangular), exponential averaging, a peak marker (`f₀`, dB) and a fixed
+−120…0 dB scale.
 
 LED scheme is described in the board section above (heartbeat, USB, data,
 generator, alarm).
@@ -202,8 +215,9 @@ generator, alarm).
 
 - Firmware: builds with **0 warnings**; ADC1 + DMA1_CH1 verified against the
   reference manual (register map, SQR/SMPR layout, DR offset 0x40).
-- Desktop: builds (a few intentionally-unused protocol/DSP helpers remain as
-  dead-code warnings — they are part of the protocol API), unit tests pass.
+- Desktop: builds with **0 warnings**; 13 unit tests pass. New UI features:
+  active-channel measurements, cursors with deltas, FFT windows + averaging +
+  peak marker, auto-set, sample-rate selector, per-channel offset.
 - `firmware/src/test_usb.rs` is a legacy standalone USB test; to build it,
   uncomment the `[[bin]]` entry in `firmware/Cargo.toml`.
 

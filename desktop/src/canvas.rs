@@ -52,6 +52,10 @@ pub struct TraceCanvas {
     pub time_per_div_ms: f32,
     /// Подсветка маркера канала (индекс) — для подсветки активного канала.
     pub highlight: Option<usize>,
+    /// Смещение трассы канала по вертикали, вольт (выровнено с `channels`).
+    pub offsets: Vec<f32>,
+    /// Две вертикальные метки-курсора как доли ширины [0..1]: (A, B).
+    pub cursors: Option<(f32, f32)>,
 }
 
 impl TraceCanvas {
@@ -65,6 +69,8 @@ impl TraceCanvas {
             v_per_div: 0.5,
             time_per_div_ms: 1.0,
             highlight: None,
+            offsets: Vec::new(),
+            cursors: None,
         }
     }
 
@@ -80,6 +86,24 @@ impl TraceCanvas {
 
     pub fn time_per_div_ms(mut self, t: f32) -> Self {
         self.time_per_div_ms = t;
+        self
+    }
+
+    /// Вертикальные смещения трасс каналов (вольт), по одному на канал.
+    pub fn offsets(mut self, offs: Vec<f32>) -> Self {
+        self.offsets = offs;
+        self
+    }
+
+    /// Подсветить канал (индекс позиции в `channels`).
+    pub fn highlight(mut self, ch: Option<usize>) -> Self {
+        self.highlight = ch;
+        self
+    }
+
+    /// Показать пару курсоров (доли ширины 0..1).
+    pub fn cursors(mut self, c: Option<(f32, f32)>) -> Self {
+        self.cursors = c;
         self
     }
 }
@@ -137,9 +161,9 @@ impl Element for TraceCanvas {
         window.paint_quad(fill(bounds, SCOPE_BG));
 
         let per_div_px = size.height / divs_y as f32;
-        // Нормированное значение (в единицах UNIT_V) → пиксель Y.
-        let my = |v: f32| -> Pixels {
-            let volts = v * UNIT_V;
+        // Нормированное значение (в единицах UNIT_V) → пиксель Y, со смещением канала (В).
+        let my = |v: f32, off_v: f32| -> Pixels {
+            let volts = v * UNIT_V + off_v;
             origin.y + size.height * 0.5 - (volts / v_per_div) * per_div_px
         };
 
@@ -174,7 +198,7 @@ impl Element for TraceCanvas {
 
         // Уровень триггера (пунктир)
         if let Some(level) = trig {
-            let y = my(level);
+            let y = my(level, 0.0);
             let mut b = PathBuilder::stroke(px(1.0)).dash_array(&[px(4.), px(3.)]);
             b.move_to(Point::new(origin.x, y));
             b.line_to(Point::new(origin.x + size.width, y));
@@ -186,6 +210,8 @@ impl Element for TraceCanvas {
         let n_px = (size.width.as_f32().round()).max(1.0) as usize;
         for (ci, ch) in self.channels.iter().enumerate() {
             let color = channel_color(ci);
+            let off = self.offsets.get(ci).copied().unwrap_or(0.0);
+            let lw_ch = if self.highlight == Some(ci) { lw + 1.2 } else { lw };
             let ys = ch.as_slice();
             let n = ys.len();
             if n < 2 {
@@ -193,11 +219,11 @@ impl Element for TraceCanvas {
             }
 
             if n <= n_px * 2 {
-                let mut b = PathBuilder::stroke(px(lw));
+                let mut b = PathBuilder::stroke(px(lw_ch));
                 for (i, &v) in ys.iter().enumerate() {
                     let pt = Point::new(
                         origin.x + size.width * (i as f32 / (n - 1) as f32),
-                        my(v),
+                        my(v, off),
                     );
                     if i == 0 {
                         b.move_to(pt);
@@ -209,7 +235,7 @@ impl Element for TraceCanvas {
                     window.paint_path(p, color);
                 }
             } else {
-                let mut b = PathBuilder::stroke(px(lw));
+                let mut b = PathBuilder::stroke(px(lw_ch));
                 let scale = n as f32 / n_px as f32;
                 for col in 0..n_px {
                     let i0 = (col as f32 * scale) as usize;
@@ -222,12 +248,24 @@ impl Element for TraceCanvas {
                         if v > hi { hi = v; }
                     }
                     let x = origin.x + size.width * (col as f32 / n_px as f32);
-                    b.move_to(Point::new(x, my(lo)));
-                    b.line_to(Point::new(x, my(hi)));
+                    b.move_to(Point::new(x, my(lo, off)));
+                    b.line_to(Point::new(x, my(hi, off)));
                 }
                 if let Ok(p) = b.build() {
                     window.paint_path(p, color);
                 }
+            }
+        }
+
+        // --- Курсоры A/B (вертикальные метки) ---
+        if let Some((a, b)) = self.cursors {
+            for (frac, label, col) in [
+                (a, "A", hsla(0.13, 0.9, 0.60, 0.95)),
+                (b, "B", hsla(0.02, 0.9, 0.60, 0.95)),
+            ] {
+                let x = origin.x + size.width * frac.clamp(0.0, 1.0);
+                stroke_line(window, Point::new(x, origin.y), Point::new(x, origin.y + size.height), col, 1.0);
+                draw_label(window, cx, label, Point::new(x + px(3.), origin.y + px(2.)), col);
             }
         }
     }
@@ -252,6 +290,8 @@ pub struct PlotCanvas {
     pub y_fmt: Rc<dyn Fn(f32) -> String>,
     /// Фиксированный диапазон Y (min, max); иначе — по данным.
     pub y_range: Option<(f32, f32)>,
+    /// Вертикальная метка (например, найденный пик спектра), в координатах X.
+    pub marker_x: Option<f32>,
 }
 
 impl PlotCanvas {
@@ -269,11 +309,15 @@ impl PlotCanvas {
             x_fmt,
             y_fmt,
             y_range: None,
+            marker_x: None,
         }
     }
 
     pub fn line_color(mut self, c: Hsla) -> Self { self.line_color = c; self }
     pub fn y_range(mut self, lo: f32, hi: f32) -> Self { self.y_range = Some((lo, hi)); self }
+
+    /// Вертикальная метка (например, найденный пик спектра), в координатах X.
+    pub fn marker_x(mut self, x: f32) -> Self { self.marker_x = Some(x); self }
 }
 
 impl Element for PlotCanvas {
@@ -393,6 +437,22 @@ impl Element for PlotCanvas {
         }
         if let Ok(p) = b.build() {
             window.paint_path(p, self.line_color);
+        }
+
+        // Вертикальная метка (пик) — поверх графика.
+        if let Some(mx_v) = self.marker_x {
+            if mx_v.is_finite() {
+                let x = mx(mx_v);
+                if x >= origin.x && x <= origin.x + size.width {
+                    stroke_line(
+                        window,
+                        Point::new(x, origin.y),
+                        Point::new(x, origin.y + size.height),
+                        hsla(0.13, 0.9, 0.6, 0.9),
+                        1.0,
+                    );
+                }
+            }
         }
     }
 }
