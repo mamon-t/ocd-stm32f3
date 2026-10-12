@@ -8,6 +8,8 @@ Firmware is written in **async Rust on Embassy** (embassy-stm32 0.6.0), the
 desktop frontend **labbench** is a native GUI written in **Rust / gpui-kit
 0.7.1** (Zed UI framework). No Python, no GTK.
 
+> **Русскоязычная версия:** [README_RU.md](README_RU.md).
+
 ## Layout
 
 ```
@@ -117,7 +119,7 @@ cargo build --release
 ```bash
 cd desktop
 cargo build --release
-cargo test          # 11 unit tests (protocol parser + DSP)
+cargo test          # 13 unit tests (protocol parser + DSP)
 ```
 
 Run without hardware (simulator):
@@ -196,17 +198,20 @@ amplitude switch `1..8`, and a greyed-out look while the generator is off — so
 scope probe on PA4 gives a self-test signal without external hardware.
 
 The desktop window is organised as a top toolbar (mode indicator + tab
-pictograms for Scope `∿`, Spectrum `≡`, LCR `Ω`, Transient `↗`), a left channel
-panel, the plot area (grid with volt/time axis labels), and the generator bar at
-the bottom. The channel panel carries a colour marker, on/off and active-channel
-selection (click `CHn`; its trace is highlighted), live Vpp, a **measurements
-table** for the active channel (Vpp · Vrms · avg · max · min · frequency ·
-period · duty), time/div and volt/div steppers, an **AUTO** button (fit mс/div
-and V/div to the signal), the trigger toggle, an **ADC sample-rate selector**,
-a per-channel **vertical offset** and **A/B cursors** with ΔT · 1/ΔT · ΔV
-readout. The Spectrum tab adds a window selector (Hann · Hamming · Blackman ·
-rectangular), exponential averaging, a peak marker (`f₀`, dB) and a fixed
-−120…0 dB scale.
+pictograms for Scope `∿`, Spectrum `≡`, LCR `Ω`, Transient `↗`), a **left control
+panel** whose sections are collapsible (accordion: *Channels* · *Timebase* ·
+*Trigger/Sync* · *Cursors* — at most one open), the plot area (grid with
+volt/time axis labels), a **measurements column** to the right of the plot
+(Vpp · Vrms · avg · max · min · frequency · period · duty for the active
+channel), and the generator bar pinned to the window bottom. The channel section
+carries a colour marker, on/off and active-channel selection (click `CHn`; its
+trace is highlighted) and live Vpp; time/div and volt/div steppers, an **AUTO**
+button (fit ms/div and V/div to the signal), the trigger toggle, an **ADC
+sample-rate selector**, a per-channel **vertical offset** and **A/B cursors**
+with ΔT · 1/ΔT · ΔV readout sit in their own sections. The Spectrum tab adds a
+window selector (Hann · Hamming · Blackman · rectangular), exponential averaging,
+a peak marker (`f₀`, dB) and a fixed −120…0 dB scale. In the generator bar the
+active shape and the selected amplitude are highlighted in the accent colour.
 
 LED scheme is described in the board section above (heartbeat, USB, data,
 generator, alarm).

@@ -69,6 +69,15 @@ enum Tab {
     Transient,
 }
 
+/// Секция левой панели; открыта максимум одна (аккордеон).
+#[derive(Clone, Copy, PartialEq, Debug)]
+enum PanelSection {
+    Channels,
+    Timebase,
+    Sync,
+    Cursors,
+}
+
 pub struct LabApp {
     transport: Option<Transport>,
     simulate: bool,
@@ -126,6 +135,8 @@ pub struct LabApp {
     spec_fixed_db: bool,
     /// Вертикальное смещение канала, вольт.
     ch_offset_v: [f32; 10],
+    /// Открытая секция левой панели (аккордеон).
+    open_section: Option<PanelSection>,
 
     status_line: String,
 }
@@ -180,6 +191,7 @@ impl LabApp {
             spec_peak: None,
             spec_fixed_db: false,
             ch_offset_v: [0.0; 10],
+            open_section: Some(PanelSection::Channels),
             status_line: "ожидание данных…".to_string(),
         };
         app.start_pump(cx);
@@ -962,22 +974,25 @@ impl LabApp {
     /// Левая панель каналов: маркер цвета, вкл/выкл канала.
     fn render_channel_panel(&self, cx: &mut Context<Self>) -> AnyElement {
         let mut panel = v_flex()
-            .w(px(210.))
+            .w(px(200.))
             .h_full()
             .bg(rgb(C_PANEL))
             .border_r_1()
             .border_color(rgb(C_BORDER))
-            .p_2()
-            .gap_1()
-            .child(Label::new("КАНАЛЫ").text_color(rgb(C_MUTED)));
+            .p_1()
+            .gap(px(2.))
+            .child(self.section_header(cx, "sec-channels", "КАНАЛЫ", PanelSection::Channels));
 
         for ch in 0..10usize {
+            if self.open_section != Some(PanelSection::Channels) {
+                break;
+            }
             let enabled = self.ch_enabled[ch];
             let vpp = if enabled { self.channel_vpp(ch) } else { 0.0 };
             let row = h_flex()
                 .w_full()
                 .px_1()
-                .gap_2()
+                .gap_1()
                 .items_center()
                 .rounded(px(3.))
                 .bg(if ch == self.selected_ch {
@@ -990,8 +1005,8 @@ impl LabApp {
                 .child(
                     div()
                         .id(format!("ch-mark-{ch}"))
-                        .w(px(8.))
-                        .h(px(16.))
+                        .w(px(7.))
+                        .h(px(13.))
                         .rounded(px(2.))
                         .bg(if enabled { channel_color(ch) } else { rgb(C_OFF).into() })
                         .on_click(cx.listener(move |this, _, _, cx| this.toggle_channel(ch, cx))),
@@ -1020,23 +1035,22 @@ impl LabApp {
             panel = panel.child(row);
         }
 
-        let t = self.time_div_ms;
-        let t_str = if t < 1.0 {
-            format!("{:.0} мкс", t * 1000.0)
-        } else {
-            format!("{t:.1} мс")
-        };
-        let v = self.v_per_div;
-        let v_str = if v < 1.0 {
-            format!("{:.0} мВ", v * 1000.0)
-        } else {
-            format!("{v:.0} В")
-        };
+        panel = panel.child(self.section_header(cx, "sec-timebase", "РАЗВЁРТКА", PanelSection::Timebase));
+        if self.open_section == Some(PanelSection::Timebase) {
+            let t = self.time_div_ms;
+            let t_str = if t < 1.0 {
+                format!("{:.0} мкс", t * 1000.0)
+            } else {
+                format!("{t:.1} мс")
+            };
+            let v = self.v_per_div;
+            let v_str = if v < 1.0 {
+                format!("{:.0} мВ", v * 1000.0)
+            } else {
+                format!("{v:.0} В")
+            };
 
-        panel
-            .child(div().h(px(8.)))
-            .child(div().w_full().h(px(1.)).bg(rgb(C_BORDER)))
-            .child(Label::new("РАЗВЁРТКА").text_color(rgb(C_MUTED)))
+            panel = panel
             .child(
                 h_flex()
                     .w_full()
@@ -1110,10 +1124,12 @@ impl LabApp {
                         this.auto_set();
                         cx.notify();
                     })),
-            )
-            .child(div().h(px(10.)))
-            .child(div().w_full().h(px(1.)).bg(rgb(C_BORDER)))
-            .child(Label::new("СИНХРОНИЗАЦИЯ").text_color(rgb(C_MUTED)))
+            );
+        }
+
+        panel = panel.child(self.section_header(cx, "sec-sync", "СИНХРОНИЗАЦИЯ", PanelSection::Sync));
+        if self.open_section == Some(PanelSection::Sync) {
+            panel = panel
             .child(
                 h_flex()
                     .w_full()
@@ -1167,10 +1183,12 @@ impl LabApp {
                                 cx.notify();
                             })),
                     ),
-            )
-            .child(div().h(px(10.)))
-            .child(div().w_full().h(px(1.)).bg(rgb(C_BORDER)))
-            .child(Label::new("КУРСОРЫ").text_color(rgb(C_MUTED)))
+            );
+        }
+
+        panel = panel.child(self.section_header(cx, "sec-cursors", "КУРСОРЫ", PanelSection::Cursors));
+        if self.open_section == Some(PanelSection::Cursors) {
+            panel = panel
             .child(
                 Button::new("cursors-toggle")
                     .label(if self.cursors_on { "Курсоры: вкл" } else { "Курсоры: выкл" })
@@ -1234,57 +1252,10 @@ impl LabApp {
                                 cx.notify();
                             })),
                     ),
-            )
-            .child({
-                let readout = match self.cursor_readout() {
-                    Some((dt, f, dv)) => format!("ΔT {dt:.2}мс  {f:.0}Гц  ΔV {dv:.2}В"),
-                    None => "курсоры выкл.".to_string(),
-                };
-                Label::new(readout).text_color(rgb(C_ACCENT))
-            })
-            .child(div().h(px(10.)))
-            .child(div().w_full().h(px(1.)).bg(rgb(C_BORDER)))
-            .child(Label::new(format!("ИЗМЕРЕНИЯ CH{}", self.selected_ch)).text_color(rgb(C_MUTED)))
-            .child({
-                let rows: Vec<(String, String)> = match self.selected_metrics() {
-                    Some(m) => {
-                        let f = if m.freq_hz >= 1000.0 {
-                            format!("{:.2} кГц", m.freq_hz / 1000.0)
-                        } else {
-                            format!("{:.1} Гц", m.freq_hz)
-                        };
-                        let per = if m.period_s < 1e-3 {
-                            format!("{:.0} мкс", m.period_s * 1e6)
-                        } else {
-                            format!("{:.2} мс", m.period_s * 1e3)
-                        };
-                        vec![
-                            ("Vpp".to_string(), format!("{:.3} В", m.vpp)),
-                            ("Vrms".to_string(), format!("{:.3} В", m.vrms)),
-                            ("Vср".to_string(), format!("{:.3} В", m.vavg)),
-                            ("Vмакс".to_string(), format!("{:.3} В", m.vmax)),
-                            ("Vмин".to_string(), format!("{:.3} В", m.vmin)),
-                            ("Частота".to_string(), f),
-                            ("Период".to_string(), per),
-                            ("Скважн.".to_string(), format!("{:.0} %", m.duty * 100.0)),
-                        ]
-                    }
-                    None => vec![("—".to_string(), "нет данных".to_string())],
-                };
-                let mut tbl = v_flex().w_full().gap_1();
-                for (name, val) in rows {
-                    tbl = tbl.child(
-                        h_flex()
-                            .w_full()
-                            .items_center()
-                            .child(Label::new(name).text_color(rgb(C_MUTED)))
-                            .child(div().flex_1())
-                            .child(Label::new(val).text_color(rgb(C_TEXT))),
-                    );
-                }
-                tbl
-            })
-            .into_any_element()
+            );
+        }
+
+        panel.into_any_element()
     }
 
     /// Байт конфигурации генератора для команды 0xC0 (см. firmware/src/main.rs).
@@ -1300,9 +1271,86 @@ impl LabApp {
         }
     }
 
+    /// Заголовок сворачиваемой секции левой панели (аккордеон: открыта максимум одна).
+    fn section_header(
+        &self,
+        cx: &mut Context<Self>,
+        id: &'static str,
+        title: &'static str,
+        section: PanelSection,
+    ) -> AnyElement {
+        let open = self.open_section == Some(section);
+        h_flex()
+            .id(id)
+            .w_full()
+            .px_1()
+            .py(px(1.))
+            .gap(px(4.))
+            .items_center()
+            .cursor_pointer()
+            .child(Label::new(if open { "▾" } else { "▸" }).text_color(rgb(C_MUTED)))
+            .child(Label::new(title).text_color(if open { rgb(C_TEXT) } else { rgb(C_MUTED) }))
+            .on_click(cx.listener(move |this, _, _, cx| {
+                this.open_section = if this.open_section == Some(section) {
+                    None
+                } else {
+                    Some(section)
+                };
+                cx.notify();
+            }))
+            .into_any_element()
+    }
+
+    /// Таблица измерений выбранного канала — отдельная колонка справа от графиков.
+    fn render_measurements(&self) -> AnyElement {
+        let rows: Vec<(String, String)> = match self.selected_metrics() {
+            Some(m) => {
+                let f = if m.freq_hz >= 1000.0 {
+                    format!("{:.2} кГц", m.freq_hz / 1000.0)
+                } else {
+                    format!("{:.1} Гц", m.freq_hz)
+                };
+                let per = if m.period_s < 1e-3 {
+                    format!("{:.0} мкс", m.period_s * 1e6)
+                } else {
+                    format!("{:.2} мс", m.period_s * 1e3)
+                };
+                vec![
+                    ("Vpp".to_string(), format!("{:.3} В", m.vpp)),
+                    ("Vrms".to_string(), format!("{:.3} В", m.vrms)),
+                    ("Vср".to_string(), format!("{:.3} В", m.vavg)),
+                    ("Vмакс".to_string(), format!("{:.3} В", m.vmax)),
+                    ("Vмин".to_string(), format!("{:.3} В", m.vmin)),
+                    ("Частота".to_string(), f),
+                    ("Период".to_string(), per),
+                    ("Скважн.".to_string(), format!("{:.0} %", m.duty * 100.0)),
+                ]
+            }
+            None => vec![("—".to_string(), "нет данных".to_string())],
+        };
+        let mut col = v_flex()
+            .w(px(170.))
+            .h_full()
+            .bg(rgb(C_PANEL))
+            .border_l_1()
+            .border_color(rgb(C_BORDER))
+            .p_2()
+            .gap_1()
+            .child(Label::new(format!("ИЗМЕРЕНИЯ CH{}", self.selected_ch)).text_color(rgb(C_TEXT)));
+        for (name, val) in rows {
+            col = col.child(
+                h_flex()
+                    .w_full()
+                    .items_center()
+                    .child(Label::new(name).text_color(rgb(C_MUTED)))
+                    .child(div().flex_1())
+                    .child(Label::new(val).text_color(rgb(C_TEXT))),
+            );
+        }
+        col.into_any_element()
+    }
+
     fn render_gen_bar(&self, cx: &mut Context<Self>) -> AnyElement {
-        let on = self.gen_en;
-        let bg = if on { C_PANEL_HI } else { C_PANEL };
         let shapes = [("○", "Выкл", 0u8), ("∿", "Синус", 1u8), ("△", "Треугольник", 2u8), ("⊓", "Меандр", 3u8)];
         let mut row = h_flex()
             .w_full()
@@ -1310,39 +1358,58 @@ impl LabApp {
             .py_2()
             .gap_2()
             .items_center()
-            .bg(rgb(bg))
+            .bg(rgb(C_PANEL))
             .border_t_1()
             .border_color(rgb(C_BORDER))
             .child(Label::new("ГЕНЕРАТОР").text_color(if self.gen_en { rgb(C_TEXT) } else { rgb(C_OFF) }))
             .child(div().w(px(1.)).h(px(18.)).bg(rgb(C_BORDER)));
         for (glyph, title, shape) in shapes {
-            let selected = if shape == 0 {
+            let active = if shape == 0 {
                 !self.gen_en
             } else {
                 self.gen_en && self.gen_shape == shape
             };
-            let btn = Button::new(title)
-                .label(glyph)
-                .tooltip(title)
-                .compact()
-                .selected(selected)
-                .on_click(cx.listener(move |this, _, _, cx| {
-                    this.gen_shape = shape.max(1);
-                    this.gen_en = shape != 0;
-                    this.send_gen();
-                    cx.notify();
-                }));
-            row = row.child(btn);
+            row = row.child(
+                div()
+                    .id(title)
+                    .px_2()
+                    .py_1()
+                    .rounded(px(4.))
+                    .cursor_pointer()
+                    .bg(if active { rgb(C_ACCENT) } else { rgb(C_PANEL_HI) })
+                    .border_1()
+                    .border_color(if active { rgb(C_ACCENT) } else { rgb(C_BORDER) })
+                    .child(
+                        Label::new(glyph).text_color(if active { rgb(0xffffff) } else { rgb(C_TEXT) }),
+                    )
+                    .on_click(cx.listener(move |this, _, _, cx| {
+                        this.gen_shape = shape.max(1);
+                        this.gen_en = shape != 0;
+                        this.send_gen();
+                        cx.notify();
+                    })),
+            );
         }
         row = row.child(div().w(px(12.)));
-        row = row.child(Label::new("АМПЛИТУДА").text_color(if self.gen_en { rgb(C_MUTED) } else { rgb(C_OFF) }));
+        row = row.child(
+            Label::new("АМПЛИТУДА").text_color(if self.gen_en { rgb(C_MUTED) } else { rgb(C_OFF) }),
+        );
         for amp in 1u8..=8 {
-            let selected = self.gen_en && self.gen_amp == amp;
+            let active = self.gen_en && self.gen_amp == amp;
             row = row.child(
-                Button::new(format!("gen-amp-{amp}"))
-                    .label(format!("{amp}"))
-                    .compact()
-                    .selected(selected)
+                div()
+                    .id(format!("gen-amp-{amp}"))
+                    .px_2()
+                    .py_1()
+                    .rounded(px(4.))
+                    .cursor_pointer()
+                    .bg(if active { rgb(C_ACCENT) } else { rgb(C_PANEL_HI) })
+                    .border_1()
+                    .border_color(if active { rgb(C_ACCENT) } else { rgb(C_BORDER) })
+                    .child(
+                        Label::new(format!("{amp}"))
+                            .text_color(if active { rgb(0xffffff) } else { rgb(C_TEXT) }),
+                    )
                     .on_click(cx.listener(move |this, _, _, cx| {
                         this.gen_amp = amp;
                         this.send_gen();
@@ -1374,7 +1441,8 @@ impl Render for LabApp {
             Tab::Transient => self.render_transient(cx),
         };
         let genbar = self.render_gen_bar(cx);
-        // Строгий приборный layout: тулбар · (панель каналов | контент) · генератор.
+        // Строгий приборный layout: тулбар · (панель | график | измерения) · генератор,
+        // средняя секция растягивается, генератор прижат к нижней границе окна.
         v_flex()
             .size_full()
             .bg(rgb(C_BG))
@@ -1385,7 +1453,14 @@ impl Render for LabApp {
                     .w_full()
                     .items_stretch()
                     .child(panel)
-                    .child(div().flex_1().h_full().p_3().child(content)),
+                    .child(
+                        h_flex()
+                            .flex_1()
+                            .h_full()
+                            .items_stretch()
+                            .child(div().flex_1().h_full().p_3().child(content))
+                            .child(self.render_measurements()),
+                    ),
             )
             .child(genbar)
     }
