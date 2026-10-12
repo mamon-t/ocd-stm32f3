@@ -8,6 +8,8 @@ USB-лаборатория на плате **STM32F3DISCOVERY** (**STM32F303VCT6
 **labbench** — нативный GUI на **Rust / gpui-kit 0.7.1** (UI-фреймворк Zed).
 Никакого Python и GTK.
 
+![GUI labbench](docs/screen.png)
+
 ## Структура
 
 ```
@@ -16,14 +18,13 @@ USB-лаборатория на плате **STM32F3DISCOVERY** (**STM32F303VCT6
 │   ├── src/main.rs          # ADC1 + DMA1_CH1 + USB CDC-ACM, цикл команд/ACK
 │   ├── src/test_usb.rs      # Автономный USB smoke-тест (В сборку НЕ входит)
 │   ├── memory.x             # FLASH 256K @ 0x0800_0000, RAM 40K @ 0x2000_0000
-│   ├── .cargo/config.toml   # target thumbv7em-none-eabi + link.x/defmt.x
-│   └── flash.sh             # Сборка + прошивка через dfu-util (bootloader DFU)
+│   └── .cargo/config.toml   # target thumbv7em-none-eabi + link.x/defmt.x
 ├── desktop/                 # GUI "labbench" (gpui-kit 0.7.1)
 │   ├── src/main.rs          # Вкладки: Осциллограф · Спектр · LCR · Transient
 │   ├── src/canvas.rs        # TraceCanvas: сетка / триггер / трассы каналов
 │   ├── src/dsp.rs           # БПФ (dBFS), триггер, импеданс LCR, время нарастания
 │   └── src/transport.rs     # Протокол v2 поверх USB-CDC + автопоиск порта
-├── 99-stm32.rules           # udev-правила: ST-LINK (0483:5710/3748) + STM32 DFU
+├── 99-stm32.rules           # udev-правила: ST-LINK (0483:5710/3748) для probe-rs
 ├── docs/hardware_verification_plan.md  # План ручной проверки на плате
 └── tmp/                     # Локальные копии официальных документов ST и демо-прошивки
 ```
@@ -70,34 +71,31 @@ USB-лаборатория на плате **STM32F3DISCOVERY** (**STM32F303VCT6
 - Все входы опрашиваются через ADC1 в режиме continuous + circular, выгрузка
   в ОЗУ — **DMA1_CH1** (кольцевой буфер **2520** сэмплов — LCM(1..10), делится
   без остатка на любой набор активных каналов), переполнение сообщается в кадре.
-- Светодиоды (все включаются высоким уровнем, LED в GND через ~510–680 Ом):
-  - **LD4 (синий) = PE8** — heartbeat (мигает, пока прошивка жива);
-  - **LD5 (оранжевый) = PE10** — USB-CDC подключён (хост открыл порт);
-  - **LD6 (зелёный) = PE15** — идёт поток кадров данных;
-  - **LD7 (зелёный) = PE11** — тестовый генератор включён;
-  - **LD10 (красный) = PE13** — тревога: переполнение ADC/потеря ACK (мигает ~4 с).
+- Светодиоды сигнализируют состояние прошивки — см. раздел *LED-индикация* ниже.
 
-### Вход в бутлоадер DFU
+### Прошивка (ST-LINK + probe-rs)
 
-Программного входа в DFU **намеренно нет**. На STM32F3 режим загрузки
-определяется пином **BOOT0** при сбросе (RM0316 §3.5) и не переключается
-записью `SYSCFG_MEMRMP`. Чтобы прошить прошивку:
+Прошивка и отладка идут через бортовой **ST-LINK/V2** (`0483:3748`)
+посредством [`probe-rs`](https://probe.rs):
 
-1. Замкнуть **SB19** (BOOT0 → 1; по умолчанию пин подтянут к GND через 510 Ом).
-2. Нажать **RESET (B2)** — ROM-загрузчик появится как `0483:df11`.
-3. Выполнить `./firmware/flash.sh`.
-4. Разомкнуть **SB19**, снова нажать RESET — стартует приложение.
+```bash
+cd firmware
+cargo +nightly build --release
+probe-rs run --chip STM32F303VC --scan-region ram \
+  target/thumbv7em-none-eabi/release/ocd-stm32f3
+```
 
 ## Сборка
 
 Требования:
 
-- Rust (стабильный) с таргетом `thumbv7em-none-eabi`
-  (`rustup target add thumbv7em-none-eabi`).
+- Rust с тулчейном **nightly** — таргет прошивки `thumbv7em-none-eabi` ставится
+  только для nightly, сборка прошивки — `cargo +nightly build --release`
+  (`rustup toolchain install nightly && rustup +nightly target add thumbv7em-none-eabi`).
 - Для desktop на Linux: десктопная сессия (gpui нужен дисплей/GPU) и `libudev`
   для сборки крейта `serialport`.
-- Для прошивки: `arm-none-eabi-objcopy` + `dfu-util`; udev-правила дают доступ
-  к `0483:df11` для группы `plugdev`.
+- Для прошивки: `probe-rs`; правила из `99-stm32.rules` дают доступ к ST-LINK
+  (`0483:3748`) для группы `plugdev`.
 
 Крейты embassy закреплены на ревизию git `84444a19` (тег embassy-stm32-v0.6.0) —
 см. `firmware/Cargo.toml`; версии внутри кластера поднимать только синхронно.
@@ -106,8 +104,9 @@ USB-лаборатория на плате **STM32F3DISCOVERY** (**STM32F303VCT6
 
 ```bash
 cd firmware
-cargo build --release
-./flash.sh          # собирает, ждёт 0483:df11, шьёт через dfu-util
+cargo +nightly build --release
+probe-rs run --chip STM32F303VC --scan-region ram \
+  target/thumbv7em-none-eabi/release/ocd-stm32f3
 ```
 
 ### Desktop
@@ -210,8 +209,20 @@ Vср · Vмакс · Vмин · частота · период · скважн�
 (`f₀`, дБ) и фиксированную шкалу −120…0 дБ. В полосе генератора активная форма
 и выбранная амплитуда подсвечиваются акцентным цветом.
 
-Схема светодиодов — в разделе про плату выше (heartbeat, USB, данные,
-генератор, тревога).
+### LED-индикация
+
+Светодиоды платы (включаются высоким уровнем; LED в GND через ~510–680 Ом)
+показывают состояние прошивки:
+
+| LED  | Цвет     | Пин  | Назначение |
+|------|----------|------|-----------|
+| LD4  | синий    | PE8  | heartbeat — мигает, пока прошивка жива |
+| LD5  | оранжевый| PE10 | USB-CDC подключён (хост открыл порт) |
+| LD6  | зелёный  | PE15 | идёт поток кадров данных |
+| LD7  | зелёный  | PE11 | тестовый генератор включён |
+| LD10 | красный  | PE13 | тревога — переполнение ADC/потеря ACK (мигает ~4 с) |
+
+![Плата: подключение и LED-индикация](docs/1791773604596.jpg)
 
 ## Статус
 

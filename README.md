@@ -10,6 +10,8 @@ desktop frontend **labbench** is a native GUI written in **Rust / gpui-kit
 
 > **Русскоязычная версия:** [README_RU.md](README_RU.md).
 
+![labbench desktop GUI](docs/screen.png)
+
 ## Layout
 
 ```
@@ -18,14 +20,13 @@ desktop frontend **labbench** is a native GUI written in **Rust / gpui-kit
 │   ├── src/main.rs          # ADC1 + DMA1_CH1 + USB CDC-ACM, command/ACK loop
 │   ├── src/test_usb.rs      # Standalone USB smoke test (NOT part of the build)
 │   ├── memory.x             # FLASH 256K @ 0x0800_0000, RAM 40K @ 0x2000_0000
-│   ├── .cargo/config.toml   # target thumbv7em-none-eabi + link.x/defmt.x
-│   └── flash.sh             # Build + flash via dfu-util (DFU bootloader)
+│   └── .cargo/config.toml   # target thumbv7em-none-eabi + link.x/defmt.x
 ├── desktop/                 # "labbench" GUI (gpui-kit 0.7.1)
 │   ├── src/main.rs          # Tabs: Oscilloscope · Spectrum · LCR · Transient
 │   ├── src/canvas.rs        # TraceCanvas: grid / trigger / per-channel traces
 │   ├── src/dsp.rs           # FFT (dBFS), trigger, LCR impedance, rise time
 │   └── src/transport.rs     # Protocol v2 over USB-CDC + port auto-detect
-├── 99-stm32.rules           # udev rules: ST-LINK (0483:5710/3748) + STM32 DFU
+├── 99-stm32.rules           # udev rules: ST-LINK (0483:5710/3748) for probe-rs
 ├── docs/hardware_verification_plan.md  # Manual hardware test procedure
 └── tmp/                     # Local copies of official ST docs & demo firmware
 ```
@@ -69,38 +70,36 @@ Two USB connectors are used (both mini-B, both needed at once):
 Notes:
 
 - **PA0 also carries the USER button B1** (SB20 closed by default): the pin is
-  pulled up (~3.3 V) and goes low while the button is held.
+  pulled up (\~3.3 V) and goes low while the button is held.
 - All inputs are sampled through ADC1 configured continuous + circular,
   transferred to RAM by **DMA1_CH1** (**2520**-sample ring buffer — LCM(1..10),
   so any active channel set divides it evenly), overrun is reported in-band.
-- User LEDs (all driven high, LED to GND via ~510–680 Ω):
-  - **LD4 (blue) = PE8** — heartbeat (blinks while the firmware is alive);
-  - **LD5 (orange) = PE10** — USB CDC connected (host opened the port);
-  - **LD6 (green) = PE15** — data frames are flowing;
-  - **LD7 (green) = PE11** — test generator is ON;
-  - **LD10 (red) = PE13** — alarm: ADC overrun/ACK loss (blinks ~4 s).
+- The user LEDs signal the firmware state — see *LED signalling* below.
 
-### Entering the DFU bootloader
+### Flashing (ST-LINK + probe-rs)
 
-Software DFU entry is **intentionally not implemented**. On STM32F3 the boot
-mode is selected by the **BOOT0 pin** at reset (RM0316 §3.5) and cannot be
-changed by writing `SYSCFG_MEMRMP`. To flash the firmware:
+Flashing and debugging go through the on-board **ST-LINK/V2** (`0483:3748`)
+using [`probe-rs`](https://probe.rs):
 
-1. Close **SB19** (BOOT0 → 1, the pin is pulled down by 510 Ω by default).
-2. Press **RESET (B2)** — the ROM bootloader appears as `0483:df11`.
-3. Run `./firmware/flash.sh`.
-4. Open **SB19**, press RESET again — the application starts.
+```bash
+cd firmware
+cargo +nightly build --release
+probe-rs run --chip STM32F303VC --scan-region ram \
+  target/thumbv7em-none-eabi/release/ocd-stm32f3
+```
 
 ## Building
 
 Prerequisites:
 
-- Rust (stable is fine) with target `thumbv7em-none-eabi`
-  (`rustup target add thumbv7em-none-eabi`).
+- Rust with the **nightly** toolchain — the firmware target `thumbv7em-none-eabi`
+  is installed for nightly only, and the firmware builds with
+  `cargo +nightly build --release`
+  (`rustup toolchain install nightly && rustup +nightly target add thumbv7em-none-eabi`).
 - For desktop builds on Linux: a desktop session (gpui needs a display/GPU)
   and `libudev` to build the `serialport` crate.
-- To flash: `arm-none-eabi-objcopy` + `dfu-util`; the udev rules provide
-  access to `0483:df11` for the `plugdev` group.
+- To flash: `probe-rs`; the provided udev rules (`99-stm32.rules`) give non-root
+  access to the ST-LINK (`0483:3748`) for the `plugdev` group.
 
 The embassy crates are pinned to the git revision `84444a19`
 (embassy-stm32-v0.6.0 tag) — see `firmware/Cargo.toml`; do not mix versions
@@ -110,8 +109,9 @@ across the embassy cluster.
 
 ```bash
 cd firmware
-cargo build --release
-./flash.sh          # builds, waits for 0483:df11, flashes via dfu-util
+cargo +nightly build --release
+probe-rs run --chip STM32F303VC --scan-region ram \
+  target/thumbv7em-none-eabi/release/ocd-stm32f3
 ```
 
 ### Desktop
@@ -150,7 +150,7 @@ AA 55 <flags> <seq> <nch> <ch0_lo> <ch0_hi> ... <ch(n-1)_lo> <ch(n-1)_hi>
 - `nch` — number of channels in this frame (1..10)
 - samples — 12-bit ADC values, little-endian `u16`. The desktop maps a raw
   value `r` to units of full scale: `r / 2047.5 − 1.0`
-  (0x0000 → −1.0, 0x0FFF → ~+1.0).
+  (0x0000 → −1.0, 0x0FFF → \~+1.0).
 
 ### Commands PC → MCU
 
@@ -170,7 +170,7 @@ AA 55 <flags> <seq> <nch> <ch0_lo> <ch0_hi> ... <ch(n-1)_lo> <ch(n-1)_hi>
 | ACK_MASK     | `0xB3` | `<mask_lo> <mask_hi>` (channel enable mask) |
 | ACK_FS       | `0xA4` | `<fs: u32 LE>` — **measured** scan rate, Hz |
 
-`ACK_FS` is emitted periodically (~0.5 s) while streaming: the firmware
+`ACK_FS` is emitted periodically (\~0.5 s) while streaming: the firmware
 measures how many scan frames it actually produced and reports the real
 per-channel sample rate. The desktop uses this value directly for the FFT and
 LCR math instead of assuming it from the sampling-time table — so the spectrum
@@ -213,8 +213,20 @@ window selector (Hann · Hamming · Blackman · rectangular), exponential averag
 a peak marker (`f₀`, dB) and a fixed −120…0 dB scale. In the generator bar the
 active shape and the selected amplitude are highlighted in the accent colour.
 
-LED scheme is described in the board section above (heartbeat, USB, data,
-generator, alarm).
+### LED signalling
+
+The board's user LEDs (driven high; LED to GND through \~510–680 Ω) show the
+firmware state:
+
+| LED  | Colour | Pin  | Meaning |
+|------|--------|------|---------|
+| LD4  | blue   | PE8  | heartbeat — blinks while the firmware is alive |
+| LD5  | orange | PE10 | USB CDC connected (host opened the port) |
+| LD6  | green  | PE15 | data frames are flowing |
+| LD7  | green  | PE11 | test generator ON |
+| LD10 | red    | PE13 | alarm — ADC overrun / ACK loss (blinks \~4 s) |
+
+![Board wiring and LED signalling](docs/1791773604596.jpg)
 
 ## Status
 
